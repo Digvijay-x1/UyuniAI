@@ -3,11 +3,14 @@ from datetime import datetime, timedelta
 
 from uyuni_ai_agent.config import load_config
 
+print("[DEBUG] prometheus_client.py module loaded")  #LOGS REM
+
 
 def query_prometheus(prom_ql):
     """Execute an instant PromQL query and return the results."""
     config = load_config()
     URL = f"{config['prometheus']['url']}/api/v1/query"
+    print("[DEBUG] querying prometheus: %s query=%s" % (URL, prom_ql[:80]))  #LOGS REM
 
     params = {
         'query': prom_ql

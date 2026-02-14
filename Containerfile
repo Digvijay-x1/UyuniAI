@@ -2,6 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /opt/uyuni-ai-agent
 
+# Disable Python output buffering so prints show in podman logs
+ENV PYTHONUNBUFFERED=1
+
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
