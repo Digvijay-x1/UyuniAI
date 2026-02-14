@@ -1,0 +1,28 @@
+prometheus:
+  url: "http://167.71.227.138:9090"
+
+alertmanager:
+  url: "http://167.71.227.138:9093"
+
+minions:
+  - id: "SaltClient"
+    instance: "SaltClient:9100"
+
+thresholds:
+  memory:
+    warning: 80
+    critical: 95
+  cpu:
+    warning: 80
+    critical: 95
+  disk:
+    warning: 85
+    critical: 95
+
+llm:
+  provider: "huggingface"  # "openai", "google_genai", or "huggingface"
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  # api_key loaded from env: LLM_API_KEY
+
+polling:
+  interval_seconds: 60
