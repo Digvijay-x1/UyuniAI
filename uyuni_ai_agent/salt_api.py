@@ -3,66 +3,77 @@ import requests
 from uyuni_ai_agent.config import load_config
 
 
-class SaltAPI:
-    """Client for the Uyuni Salt HTTP API.
-    
-    Since the agent runs as a sidecar container (not inside Uyuni),
-    we use the Salt API over HTTP instead of LocalClient.
+class ToolsServerClient:
+    """HTTP client for the Flask tools server running inside the Uyuni container.
+
+    Replaces direct Salt API calls with simple HTTP requests to the
+    tools_server.py Flask app.
     """
 
     def __init__(self):
         config = load_config()
-        self.url = config["salt_api"]["url"]
-        self.username = config["salt_api"]["username"]
-        self.password = config["salt_api"]["password"]
-        self.token = None
+        self.url = config["tools_server"]["url"]
 
-    def login(self):
-        """Authenticate and get a session token."""
-        response = requests.post(
-            f"{self.url}/login",
-            json={
-                "username": self.username,
-                "password": self.password,
-                "eauth": "auto",
-            },
-        )
-        if response.status_code == 200:
-            self.token = response.json()["return"][0]["token"]
-        else:
-            raise Exception(f"Salt API login failed: {response.status_code} - {response.text}")
-
-    def cmd(self, minion_id, fun, arg=None):
-        """Execute a Salt command on a minion via the API."""
-        if not self.token:
-            self.login()
-
-        payload = {
-            "client": "local",
-            "tgt": minion_id,
-            "fun": fun,
-        }
-        if arg:
-            payload["arg"] = arg
-
-        headers = {"X-Auth-Token": self.token}
-
+    def run_command(self, minion_id, cmd):
+        """Run a shell command on a minion."""
+        print("[DEBUG] tools_server: run_command minion=%s cmd=%s" % (minion_id, cmd[:60]))  #LOGS REM
         try:
-            response = requests.post(self.url, json=payload, headers=headers)
+            response = requests.post(
+                f"{self.url}/run_command",
+                json={"minion_id": minion_id, "cmd": cmd},
+                timeout=30,
+            )
             if response.status_code == 200:
-                result = response.json()["return"][0]
-                return result.get(minion_id, "No response from minion")
-            elif response.status_code == 401:
-                self.login()
-                headers = {"X-Auth-Token": self.token}
-                response = requests.post(self.url, json=payload, headers=headers)
-                if response.status_code == 200:
-                    result = response.json()["return"][0]
-                    return result.get(minion_id, "No response from minion")
+                return response.json()["result"]
             return f"Error: {response.status_code} - {response.text}"
         except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+            return f"Tools server call failed: {str(e)}"
+
+    def disk_usage(self, minion_id):
+        """Get disk usage for a minion."""
+        print("[DEBUG] tools_server: disk_usage minion=%s" % minion_id)  #LOGS REM
+        try:
+            response = requests.get(
+                f"{self.url}/disk_usage",
+                params={"minion_id": minion_id},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                return str(response.json()["result"])
+            return f"Error: {response.status_code} - {response.text}"
+        except Exception as e:
+            return f"Tools server call failed: {str(e)}"
+
+    def service_status(self, minion_id, service):
+        """Check if a service is running on a minion."""
+        print("[DEBUG] tools_server: service_status minion=%s service=%s" % (minion_id, service))  #LOGS REM
+        try:
+            response = requests.get(
+                f"{self.url}/service_status",
+                params={"minion_id": minion_id, "service": service},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                return response.json()["result"]
+            return f"Error: {response.status_code} - {response.text}"
+        except Exception as e:
+            return f"Tools server call failed: {str(e)}"
+
+    def service_logs(self, minion_id, service, lines=50):
+        """Get recent journal logs for a service."""
+        print("[DEBUG] tools_server: service_logs minion=%s service=%s" % (minion_id, service))  #LOGS REM
+        try:
+            response = requests.get(
+                f"{self.url}/service_logs",
+                params={"minion_id": minion_id, "service": service, "lines": lines},
+                timeout=30,
+            )
+            if response.status_code == 200:
+                return response.json()["result"]
+            return f"Error: {response.status_code} - {response.text}"
+        except Exception as e:
+            return f"Tools server call failed: {str(e)}"
 
 
 # Shared instance used by all tools
-salt_api = SaltAPI()
+tools_client = ToolsServerClient()

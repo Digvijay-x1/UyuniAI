@@ -17,13 +17,9 @@ def load_config():
         config = yaml.safe_load(f)
     print("[DEBUG] config loaded, keys: %s" % list(config.keys()))  #LOGS REM
     
-    # Override secrets from environment if set
+    # Override LLM API key from environment if set
     api_key = os.environ.get("LLM_API_KEY", "")
     if api_key:
         config["llm"]["api_key"] = api_key
-
-    salt_password = os.environ.get("SALT_API_PASSWORD", "")
-    if salt_password:
-        config["salt_api"]["password"] = salt_password
     
     return config

@@ -4,10 +4,8 @@ prometheus:
 alertmanager:
   url: "http://167.71.227.138:9093"
 
-salt_api:
-  url: "https://134.209.146.26:9090"
-  username: "admin"
-  password: ""  # set via SALT_API_PASSWORD env var
+tools_server:
+  url: "http://134.209.146.26:5000"
 
 minions:
   - id: "SaltClient"
