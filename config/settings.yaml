@@ -5,7 +5,7 @@ alertmanager:
   url: "http://167.71.227.138:9093"
 
 tools_server:
-  url: "http://134.209.146.26:5000"
+  url: "http://localhost:5000"
 
 minions:
   - id: "SaltClient"
