@@ -1,8 +1,6 @@
-import salt.client
 from langchain_core.tools import tool
 
-
-local = salt.client.LocalClient()
+from uyuni_ai_agent.salt_api import salt_api
 
 
 @tool
@@ -11,8 +9,7 @@ def check_connectivity(minion_id: str, target: str) -> str:
     Use this when you suspect network issues are causing service problems.
     """
     cmd = f"ping -c 3 {target}"
-    result = local.cmd(minion_id, 'cmd.run', [cmd])
-    return result.get(minion_id, "No response from minion")
+    return salt_api.cmd(minion_id, 'cmd.run', [cmd])
 
 
 @tool
@@ -21,5 +18,4 @@ def get_listening_ports(minion_id: str) -> str:
     Use this to verify which services have their ports open and listening.
     """
     cmd = "ss -tlnp"
-    result = local.cmd(minion_id, 'cmd.run', [cmd])
-    return result.get(minion_id, "No response from minion")
+    return salt_api.cmd(minion_id, 'cmd.run', [cmd])
