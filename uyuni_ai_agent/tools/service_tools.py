@@ -1,6 +1,6 @@
 from langchain_core.tools import tool
 
-from uyuni_ai_agent.salt_api import tools_client
+from uyuni_ai_agent.salt_api import salt_client
 
 
 @tool
@@ -9,7 +9,7 @@ def get_service_status(minion_id: str, service: str) -> str:
     Use this to verify whether a specific service (e.g. postgresql, apache2)
     is active or has crashed.
     """
-    result = tools_client.service_status(minion_id, service)
+    result = salt_client.service_status(minion_id, service)
     if result is True:
         return f"{service} is running"
     elif result is False:
@@ -24,4 +24,4 @@ def get_service_logs(minion_id: str, service: str, lines: int = 50) -> str:
     Use this when a service is down or misbehaving and you need to
     check the logs for errors.
     """
-    return tools_client.service_logs(minion_id, service, lines)
+    return salt_client.service_logs(minion_id, service, lines)

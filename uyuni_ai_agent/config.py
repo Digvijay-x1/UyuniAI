@@ -21,5 +21,10 @@ def load_config():
     api_key = os.environ.get("LLM_API_KEY", "")
     if api_key:
         config["llm"]["api_key"] = api_key
+
+    # Override Salt API password from environment if set
+    salt_pw = os.environ.get("SALT_API_PASSWORD", "")
+    if salt_pw:
+        config["salt_api"]["password"] = salt_pw
     
     return config

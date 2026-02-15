@@ -1,6 +1,6 @@
 from langchain_core.tools import tool
 
-from uyuni_ai_agent.salt_api import tools_client
+from uyuni_ai_agent.salt_api import salt_client
 
 
 @tool
@@ -9,7 +9,7 @@ def get_disk_usage(minion_id: str) -> str:
     Use this when you detect high disk usage and need to see which
     partitions are filling up.
     """
-    return tools_client.disk_usage(minion_id)
+    return salt_client.disk_usage(minion_id)
 
 
 @tool
@@ -22,4 +22,4 @@ def find_large_files(minion_id: str, path: str = "/", min_size: str = "100M") ->
         min_size: minimum file size to report (default: 100M)
     """
     cmd = f"find {path} -type f -size +{min_size} 2>/dev/null | head -20"
-    return tools_client.run_command(minion_id, cmd)
+    return salt_client.run_command(minion_id, cmd)
