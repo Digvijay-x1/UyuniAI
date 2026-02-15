@@ -18,6 +18,8 @@ A separate Flask server (`tools_server.py`) runs inside the Uyuni container to g
 
 Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertManager URL, minion IDs, LLM provider (HuggingFace, Google Gemini, or OpenAI), and anomaly thresholds.
 
+Note: minon IDs will be handled automatically in the next update
+
 ```bash
 # On the Uyuni host (Master):
 
@@ -30,9 +32,7 @@ python3 /opt/tools_server.py
 # 2. Build and run the agent
 podman build -t uyuni-ai-agent -f Containerfile .
 # don't use `--dry-run` if you want to send real alerts
-podman run -d --name ai-agent \
-  --network=container:uyuni-server \
-  -e LLM_API_KEY="your_key" \
-  uyuni-ai-agent --dry-run
+podman run -d --name ai-agent --network=container:uyuni-server -e LLM_API_KEY="your_key" uyuni-ai-agent --dry-run
+
 ```
 
