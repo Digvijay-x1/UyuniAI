@@ -10,8 +10,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class SaltAPIClient:
     """Client for the Salt REST API (rest_cherrypy) inside the Uyuni container.
 
-    Authenticates via /login with eauth=file, then uses the session token
-    for all subsequent Salt commands.
+    Uses requests.Session() for cookie-based authentication as shown in
+    the official Salt REST API docs:
+    https://docs.saltproject.io/en/latest/ref/netapi/all/salt.netapi.rest_cherrypy.html
     """
 
     def __init__(self):
@@ -21,68 +22,67 @@ class SaltAPIClient:
         self.username = api_cfg["username"]
         self.password = api_cfg.get("password", "")
         self.eauth = api_cfg.get("eauth", "file")
-        self.token = None
+        self.session = requests.Session()
+        self.session.verify = False  # Self-signed cert
+        self.logged_in = False
 
     def login(self):
-        """Authenticate and store the session token."""
+        """Authenticate via /login. Session cookies are stored automatically."""
         print("[DEBUG] salt_api: logging in to %s" % self.url)
-        response = requests.post(
+        resp = self.session.post(
             f"{self.url}/login",
-            json={
+            data={
                 "username": self.username,
                 "password": self.password,
                 "eauth": self.eauth,
             },
-            verify=False,
             timeout=15,
         )
-        response.raise_for_status()
-        data = response.json()
-        self.token = data["return"][0]["token"]
-        print("[DEBUG] salt_api: login successful, token=%s..." % self.token[:12])
+        resp.raise_for_status()
+        self.logged_in = True
+        token = resp.json()["return"][0]["token"]
+        print("[DEBUG] salt_api: login successful, token=%s..." % token[:12])
 
-    def _ensure_token(self):
-        """Login if we don't have a token yet."""
-        if not self.token:
+    def _ensure_login(self):
+        """Login if we haven't yet."""
+        if not self.logged_in:
             self.login()
 
     def _call(self, tgt, fun, arg=None):
-        """Make a Salt API call. Re-authenticates on 401."""
-        self._ensure_token()
+        """Make a Salt API call via POST /. Uses session cookies for auth.
 
-        payload = {
+        Body is a JSON array of lowstate dicts as per the docs.
+        Re-authenticates once on 401.
+        """
+        self._ensure_login()
+
+        lowstate = {
             "client": "local",
             "tgt": tgt,
             "fun": fun,
         }
         if arg:
-            payload["arg"] = arg
+            lowstate["arg"] = arg
 
-        headers = {"X-Auth-Token": self.token}
-
-        response = requests.post(
+        resp = self.session.post(
             self.url,
-            json=payload,
-            headers=headers,
-            verify=False,
+            json=[lowstate],
             timeout=60,
         )
 
-        # Token expired -- re-login and retry once
-        if response.status_code == 401:
-            print("[DEBUG] salt_api: token expired, re-authenticating...")
+        # Token/cookie expired -- re-login and retry once
+        if resp.status_code == 401:
+            print("[DEBUG] salt_api: session expired, re-authenticating...")
+            self.logged_in = False
             self.login()
-            headers["X-Auth-Token"] = self.token
-            response = requests.post(
+            resp = self.session.post(
                 self.url,
-                json=payload,
-                headers=headers,
-                verify=False,
+                json=[lowstate],
                 timeout=60,
             )
 
-        response.raise_for_status()
-        data = response.json()
+        resp.raise_for_status()
+        data = resp.json()
         result = data.get("return", [{}])[0]
         return result.get(tgt, "No response from minion")
 
