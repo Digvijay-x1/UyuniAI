@@ -23,7 +23,7 @@ class SaltAPIClient:
         self.password = api_cfg.get("password", "")
         self.eauth = api_cfg.get("eauth", "file")
         self.session = requests.Session()
-        self.session.verify = False  # Self-signed cert
+        self.session.verify = False
         self.logged_in = False
 
     def login(self):
