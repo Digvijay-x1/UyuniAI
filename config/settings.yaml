@@ -6,7 +6,7 @@ alertmanager:
 
 salt_api:
   url: "https://localhost:9080"
-  username: "admin"
+  username: "agent"
   password: ""  # set via SALT_API_PASSWORD env var
   eauth: "file"
 
