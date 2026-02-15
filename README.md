@@ -22,7 +22,7 @@ Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertM
 # On the Uyuni host (Master):
 
 # 1. Start the tools server inside the Uyuni container
-podman cp tools_server.py uyuni-server:/opt/tools_server.py
+podman cp X-project/tools_server.py uyuni-server:/opt/tools_server.py
 mgrctl term
 # inside the uyuni server container
 python3 /opt/tools_server.py
