@@ -3,7 +3,7 @@ import datetime
 
 from uyuni_ai_agent.config import load_config
 
-    # REf https://prometheus.io/docs/alerting/latest/alerts_api/
+# Ref: https://prometheus.io/docs/alerting/latest/alerts_api/
 def send_to_alertmanager(summary, description, severity="info", minion_id="", metric_name=""):
     """Send an enriched alert to AlertManager.
     
