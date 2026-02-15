@@ -14,7 +14,7 @@ print("[DEBUG] main.py module loaded")  #LOGS REM
 
 
 def run(dry_run=False):
-    """Main polling loop. Ties all 4 steps together:
+    """Main polling loop. Loops all 4 steps together:
     1. INGEST  -- query Prometheus for metrics
     2. DETECT  -- check thresholds for anomalies
     3. INTELLIGENCE -- ReAct agent investigates via Salt + LLM

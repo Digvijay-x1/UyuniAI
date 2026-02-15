@@ -4,10 +4,10 @@ from uyuni_ai_agent.config import load_config
 
 
 class ToolsServerClient:
-    """HTTP client for the Flask tools server running inside the Uyuni container.
+    """
+    HTTP client for the Flask tools server running inside the Uyuni container.
 
-    Replaces direct Salt API calls with simple HTTP requests to the
-    tools_server.py Flask app.
+    Simple HTTP requests to the tools_server.py Flask app.
     """
 
     def __init__(self):
