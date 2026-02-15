@@ -1,61 +1,37 @@
-# AI-Powered Intelligent Monitoring & Root Cause Analysis for Uyuni
+# AI-Powered Monitoring Agent for Uyuni
 
-An AI monitoring agent that runs inside the Uyuni Podman container, continuously queries Prometheus metrics, detects anomalies, triggers Salt-based inspections via a LangGraph ReAct agent, and delivers enriched alerts through AlertManager to Slack.
+This project is part of an ongoing effort to bring intelligent, automated monitoring to [Uyuni](https://www.uyuni-project.org/). The idea is straightforward: instead of manually investigating alerts, let an AI agent do the initial triage -- pull metrics from Prometheus, figure out what's wrong using Salt, and report back with a root-cause analysis.
 
-## Pipeline
+## How it works
 
-```
-INGESTION --> DETECTION --> INTELLIGENCE --> ACTION
-Prometheus     Thresholds    LangGraph        AlertManager
-PromQL         CPU/RAM/Disk  ReAct Agent      --> Slack
-                             Salt inspections
-                             LLM analysis
-```
+The agent runs as a sidecar Podman container alongside the Uyuni server. Every 60 seconds it:
 
-## Quick Start
+1. **Pulls metrics** from Prometheus (CPU, memory, disk usage via PromQL).
+2. **Checks thresholds** -- if something crosses warning/critical levels, it flags it as an anomaly.
+3. **Investigates** -- a LangGraph ReAct agent takes over, calling Salt commands on the affected minion (e.g. listing top processes, checking service status) and reasoning about what it finds using an LLM.
+4. **Reports** -- the analysis gets sent to AlertManager, which can forward it to Slack or wherever your alerts go.
+
+A separate Flask server (`tools_server.py`) runs inside the Uyuni container to give the agent access to Salt's LocalClient over HTTP. This avoids the Salt API auth complexity and works with the container's Python 3.6.
+
+
+## Setup
+
+Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertManager URL, minion IDs, LLM provider (HuggingFace, Google Gemini, or OpenAI), and anomaly thresholds.
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# On the Uyuni host (Master):
 
-# Set your LLM API key
-export LLM_API_KEY="your_api_key_here"
+# 1. Start the tools server inside the Uyuni container
+podman cp tools_server.py uyuni-server:/opt/tools_server.py
+mgrctl term
+# inside the uyuni server container
+python3 /opt/tools_server.py
 
-# Run the agent (dry run mode -- prints alerts, does not send)
-python -m uyuni_ai_agent.main --dry-run
-
-# Run the agent (production -- sends alerts to AlertManager)
-python -m uyuni_ai_agent.main
+# 2. Build and run the agent
+podman build -t uyuni-ai-agent -f Containerfile .
+podman run -d --name ai-agent \
+  --network=container:uyuni-server \
+  -e LLM_API_KEY="your_key" \
+  uyuni-ai-agent --dry-run
 ```
 
-## Configuration
-
-Edit `config/settings.yaml` to set:
-- Prometheus and AlertManager URLs
-- Minion IDs and instance labels
-- Anomaly thresholds (warning/critical for CPU, memory, disk)
-- LLM provider (`huggingface`, `google_genai`, or `openai`) and model
-- Polling interval
-
-## Project Structure
-
-```
-X-project/
-├── uyuni_ai_agent/
-│   ├── main.py                  # Orchestrator: polling loop
-│   ├── config.py                # YAML config loader
-│   ├── prometheus_client.py     # Prometheus PromQL queries
-│   ├── anomaly_detector.py      # Threshold-based detection
-│   ├── llm_provider.py          # Configurable LLM (HF/Gemini/OpenAI)
-│   ├── react_agent.py           # LangGraph ReAct agent
-│   ├── alert_manager.py         # AlertManager integration
-│   └── tools/                   # Salt inspection tools
-│       ├── process_tools.py
-│       ├── disk_tools.py
-│       ├── service_tools.py
-│       └── network_tools.py
-├── prompts/                     # Prompt templates per scenario
-├── config/
-│   └── settings.yaml
-└── requirements.txt
-```
