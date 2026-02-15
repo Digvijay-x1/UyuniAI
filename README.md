@@ -11,7 +11,7 @@ The agent runs as a sidecar Podman container alongside the Uyuni server. Every 6
 3. **Investigates** -- a LangGraph ReAct agent takes over, calling Salt commands on the affected minion (e.g. listing top processes, checking service status) and reasoning about what it finds using an LLM.
 4. **Reports** -- the analysis gets sent to AlertManager, which can forward it to Slack or wherever your alerts go.
 
-A separate Flask server (`tools_server.py`) runs inside the Uyuni container to give the agent access to Salt's LocalClient over HTTP. This avoids the Salt API auth complexity and works with the container's Python 3.6.
+A separate Flask server (`tools_server.py`) runs inside the Uyuni container to give the agent access to Salt's LocalClient over HTTP. This avoids the Salt API auth complexity.
 
 
 ## Setup
@@ -29,6 +29,7 @@ python3 /opt/tools_server.py
 
 # 2. Build and run the agent
 podman build -t uyuni-ai-agent -f Containerfile .
+# don't use `--dry-run` if you want to send real alerts
 podman run -d --name ai-agent \
   --network=container:uyuni-server \
   -e LLM_API_KEY="your_key" \
