@@ -2,7 +2,8 @@
 
 This project is part of an ongoing effort to bring intelligent, automated monitoring to [Uyuni](https://www.uyuni-project.org/). The idea is straightforward: instead of manually investigating alerts, let an AI agent do the initial research -- pull metrics from Prometheus, figure out what's wrong using Salt, and report back with a root-cause analysis.
 
-<img width="1199" height="698" alt="image" src="https://github.com/user-attachments/assets/8bce269a-9d56-473f-ba50-fe02164c93dd" />
+<img width="1147" height="712" alt="image" src="https://github.com/user-attachments/assets/d67caca9-f297-4109-830c-58156293ef01" />
+
 
 
 ## How it works
