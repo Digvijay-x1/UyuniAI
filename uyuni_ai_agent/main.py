@@ -1,8 +1,7 @@
 import logging
 import time
-import sys
-import traceback
 import argparse
+import os
 
 from uyuni_ai_agent.config import load_config
 from uyuni_ai_agent.logging_config import setup_logging
@@ -106,13 +105,18 @@ def run(dry_run=False):
 
 
 if __name__ == "__main__":
-    # Setup logging
+    # Setup logging 
+    default_level = os.environ.get("LOG_LEVEL", "INFO")
+    setup_logging(level=default_level)
+
     try:
         config = load_config()
-        log_level = config.get("logging", {}).get("level", "INFO")
+        config_level = config.get("logging", {}).get("level", None)
+        if config_level and config_level.upper() != default_level.upper():
+            setup_logging(level=config_level)
+            logger.debug("Reconfigured logging to %s from settings.yaml", config_level)
     except Exception:
-        log_level = "INFO"
-    setup_logging(level=log_level)
+        logger.warning("Failed to load config, using default log level")
 
     logger.debug("__main__ entry point")
     parser = argparse.ArgumentParser(

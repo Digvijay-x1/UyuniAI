@@ -3,7 +3,6 @@ import logging
 import yaml
 
 logger = logging.getLogger(__name__)
-logger.debug("config.py module loaded")
 
 
 def load_config():

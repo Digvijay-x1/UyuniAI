@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from uyuni_ai_agent.config import load_config
 
 logger = logging.getLogger(__name__)
-logger.debug("prometheus_client.py module loaded")
 
 
 def query_prometheus(prom_ql):
