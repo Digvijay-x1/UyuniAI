@@ -1,16 +1,17 @@
+import logging
 import requests
 from datetime import datetime, timedelta
 
 from uyuni_ai_agent.config import load_config
 
-print("[DEBUG] prometheus_client.py module loaded")  #LOGS REM
+logger = logging.getLogger(__name__)
 
 
 def query_prometheus(prom_ql):
     """Execute an instant PromQL query and return the results."""
     config = load_config()
     URL = f"{config['prometheus']['url']}/api/v1/query"
-    print("[DEBUG] querying prometheus: %s query=%s" % (URL, prom_ql[:80]))  #LOGS REM
+    logger.debug("querying prometheus: %s query=%s", URL, prom_ql[:80])
 
     params = {
         'query': prom_ql

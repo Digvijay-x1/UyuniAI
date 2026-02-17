@@ -1,7 +1,8 @@
 import os
+import logging
 import yaml
 
-print("[DEBUG] config.py module loaded")  #LOGS REM
+logger = logging.getLogger(__name__)
 
 
 def load_config():
@@ -11,11 +12,11 @@ def load_config():
         "config",
         "settings.yaml"
     )
-    print("[DEBUG] loading config from: %s" % config_path)  #LOGS REM
-    print("[DEBUG] file exists: %s" % os.path.exists(config_path))  #LOGS REM
+    logger.debug("loading config from: %s", config_path)
+    logger.debug("file exists: %s", os.path.exists(config_path))
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
-    print("[DEBUG] config loaded, keys: %s" % list(config.keys()))  #LOGS REM
+    logger.debug("config loaded, keys: %s", list(config.keys()))
     
     # Override LLM API key from environment if set
     api_key = os.environ.get("LLM_API_KEY", "")

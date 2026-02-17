@@ -1,16 +1,16 @@
+import logging
 import time
-import sys
-import traceback
 import argparse
+import os
 
 from uyuni_ai_agent.config import load_config
+from uyuni_ai_agent.logging_config import setup_logging
 from uyuni_ai_agent.prometheus_client import get_all_metrics
 from uyuni_ai_agent.anomaly_detector import check_all_metrics
 from uyuni_ai_agent.react_agent import investigate
 from uyuni_ai_agent.alert_manager import send_to_alertmanager
 
-
-print("[DEBUG] main.py module loaded")  #LOGS REM
+logger = logging.getLogger(__name__)
 
 
 def run(dry_run=False):
@@ -20,76 +20,76 @@ def run(dry_run=False):
     3. INTELLIGENCE -- ReAct agent investigates via Salt + LLM
     4. ACTION  -- push enriched alert to AlertManager
     """
-    print("[DEBUG] run() called, dry_run=%s" % dry_run)  #LOGS REM
+    logger.debug("run() called, dry_run=%s", dry_run)
 
     try:
         config = load_config()
-        print("[DEBUG] config loaded successfully")  #LOGS REM
-        print("[DEBUG] config keys: %s" % list(config.keys()))  #LOGS REM
+        logger.debug("config loaded successfully")
+        logger.debug("config keys: %s", list(config.keys()))
     except Exception as e:
-        print("[ERROR] Failed to load config: %s" % e)  #LOGS REM
-        traceback.print_exc()  #LOGS REM
+        logger.error("Failed to load config: %s", e, exc_info=True)
         return
 
     interval = config["polling"]["interval_seconds"]
 
-    print(f"AI Monitoring Agent started. Polling every {interval}s.")
+    logger.info("AI Monitoring Agent started. Polling every %ds.", interval)
     if dry_run:
-        print("DRY RUN mode: alerts will be printed, not sent.")
+        logger.info("DRY RUN mode: alerts will be printed, not sent.")
 
     while True:
         for minion in config["minions"]:
             instance = minion["instance"]
             minion_id = minion["id"]
 
-            print(f"\n--- Checking {minion_id} ({instance}) ---")
+            logger.info("--- Checking %s (%s) ---", minion_id, instance)
 
             # Step 1: INGEST
-            print("[DEBUG] Step 1: querying Prometheus...")  #LOGS REM
+            logger.debug("Step 1: querying Prometheus...")
             try:
                 metrics = get_all_metrics(instance)
-                print(f"Metrics: mem={metrics['memory_percent']:.1f}%, "
-                      f"cpu={metrics['cpu_percent']:.1f}%, "
-                      f"disk={metrics['disk_percent']:.1f}%")
+                logger.info(
+                    "Metrics: mem=%.1f%%, cpu=%.1f%%, disk=%.1f%%",
+                    metrics['memory_percent'],
+                    metrics['cpu_percent'],
+                    metrics['disk_percent'],
+                )
             except Exception as e:
-                print("[ERROR] Prometheus query failed: %s" % e)  #LOGS REM
-                traceback.print_exc()  #LOGS REM
+                logger.error("Prometheus query failed: %s", e, exc_info=True)
                 continue
 
             # Step 2: DETECT
-            print("[DEBUG] Step 2: checking thresholds...")  #LOGS REM
+            logger.debug("Step 2: checking thresholds...")
             try:
                 anomalies = check_all_metrics(instance, minion_id)
-                print("[DEBUG] Found %d anomalies" % len(anomalies))  #LOGS REM
+                logger.debug("Found %d anomalies", len(anomalies))
             except Exception as e:
-                print("[ERROR] Anomaly detection failed: %s" % e)  #LOGS REM
-                traceback.print_exc()  #LOGS REM
+                logger.error("Anomaly detection failed: %s", e, exc_info=True)
                 continue
 
             if not anomalies:
-                print("All metrics within normal range.")
+                logger.info("All metrics within normal range.")
                 continue
 
             for anomaly in anomalies:
-                print(f"ANOMALY: {anomaly.description} "
-                      f"[{anomaly.severity.value}]")
+                logger.warning(
+                    "ANOMALY: %s [%s]", anomaly.description, anomaly.severity.value
+                )
 
                 # Step 3: INTELLIGENCE
-                print("[DEBUG] Step 3: running ReAct agent...")  #LOGS REM
+                logger.debug("Step 3: running ReAct agent...")
                 try:
                     analysis = investigate(anomaly, metrics)
-                    print(f"Analysis:\n{analysis}\n")
+                    logger.info("Analysis:\n%s", analysis)
                 except Exception as e:
-                    print("[ERROR] ReAct agent failed: %s" % e)  #LOGS REM
-                    traceback.print_exc()  #LOGS REM
+                    logger.error("ReAct agent failed: %s", e, exc_info=True)
                     analysis = f"Agent error: {e}"
 
                 # Step 4: ACTION
                 if dry_run:
-                    print(f"[DRY RUN] Would send alert: {anomaly.description}")
-                    print(f"[DRY RUN] Analysis: {analysis}")
+                    logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
+                    logger.info("[DRY RUN] Analysis: %s", analysis)
                 else:
-                    print("[DEBUG] Step 4: sending to AlertManager...")  #LOGS REM
+                    logger.debug("Step 4: sending to AlertManager...")
                     summary = f"{anomaly.metric_name} issue on {anomaly.minion_id}"
                     result = send_to_alertmanager(
                         summary=summary,
@@ -98,15 +98,27 @@ def run(dry_run=False):
                         minion_id=anomaly.minion_id,
                         metric_name=anomaly.metric_name,
                     )
-                    print(f"AlertManager: {result}")
+                    logger.info("AlertManager: %s", result)
 
-        print(f"\nSleeping {interval}s...")
-        sys.stdout.flush()  #LOGS REM
+        logger.info("Sleeping %ds...", interval)
         time.sleep(interval)
 
 
 if __name__ == "__main__":
-    print("[DEBUG] __main__ entry point")  #LOGS REM
+    # Setup logging 
+    default_level = os.environ.get("LOG_LEVEL", "INFO")
+    setup_logging(level=default_level)
+
+    try:
+        config = load_config()
+        config_level = config.get("logging", {}).get("level", None)
+        if config_level and config_level.upper() != default_level.upper():
+            setup_logging(level=config_level)
+            logger.debug("Reconfigured logging to %s from settings.yaml", config_level)
+    except Exception:
+        logger.warning("Failed to load config, using default log level")
+
+    logger.debug("__main__ entry point")
     parser = argparse.ArgumentParser(
         description="AI-Powered Monitoring Agent for Uyuni"
     )
@@ -116,9 +128,8 @@ if __name__ == "__main__":
         help="Print alerts instead of sending to AlertManager"
     )
     args = parser.parse_args()
-    print("[DEBUG] args parsed: dry_run=%s" % args.dry_run)  #LOGS REM
+    logger.debug("args parsed: dry_run=%s", args.dry_run)
     try:
         run(dry_run=args.dry_run)
     except Exception as e:
-        print("[FATAL] Unhandled exception: %s" % e)  #LOGS REM
-        traceback.print_exc()  #LOGS REM
+        logger.critical("Unhandled exception", exc_info=True)

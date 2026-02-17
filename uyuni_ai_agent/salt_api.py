@@ -1,3 +1,4 @@
+import logging
 import requests
 import urllib3
 
@@ -5,6 +6,8 @@ from uyuni_ai_agent.config import load_config
 
 # Suppress SSL warnings for self-signed certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logger = logging.getLogger(__name__)
 
 
 class SaltAPIClient:
@@ -28,7 +31,7 @@ class SaltAPIClient:
 
     def login(self):
         """Authenticate via /login. Session cookies are stored automatically."""
-        print("[DEBUG] salt_api: logging in to %s" % self.url)
+        logger.debug("salt_api: logging in to %s", self.url)
         resp = self.session.post(
             f"{self.url}/login",
             data={
@@ -41,7 +44,7 @@ class SaltAPIClient:
         resp.raise_for_status()
         self.logged_in = True
         token = resp.json()["return"][0]["token"]
-        print("[DEBUG] salt_api: login successful, token=%s..." % token[:12])
+        logger.debug("salt_api: login successful, token=%s...", token[:12])
 
     def _ensure_login(self):
         """Login if we haven't yet."""
@@ -72,7 +75,7 @@ class SaltAPIClient:
 
         # Token/cookie expired -- re-login and retry once
         if resp.status_code == 401:
-            print("[DEBUG] salt_api: session expired, re-authenticating...")
+            logger.warning("salt_api: session expired, re-authenticating...")
             self.logged_in = False
             self.login()
             resp = self.session.post(
@@ -88,7 +91,7 @@ class SaltAPIClient:
 
     def run_command(self, minion_id, cmd):
         """Run a shell command on a minion via cmd.run."""
-        print("[DEBUG] salt_api: cmd.run minion=%s cmd=%s" % (minion_id, cmd[:60]))
+        logger.debug("salt_api: cmd.run minion=%s cmd=%s", minion_id, cmd[:60])
         try:
             return self._call(minion_id, "cmd.run", [cmd])
         except Exception as e:
@@ -96,7 +99,7 @@ class SaltAPIClient:
 
     def disk_usage(self, minion_id):
         """Get disk usage for a minion via disk.usage."""
-        print("[DEBUG] salt_api: disk.usage minion=%s" % minion_id)
+        logger.debug("salt_api: disk.usage minion=%s", minion_id)
         try:
             return str(self._call(minion_id, "disk.usage"))
         except Exception as e:
@@ -104,7 +107,7 @@ class SaltAPIClient:
 
     def service_status(self, minion_id, service):
         """Check if a service is running on a minion."""
-        print("[DEBUG] salt_api: service.status minion=%s service=%s" % (minion_id, service))
+        logger.debug("salt_api: service.status minion=%s service=%s", minion_id, service)
         try:
             return self._call(minion_id, "service.status", [service])
         except Exception as e:
@@ -112,7 +115,7 @@ class SaltAPIClient:
 
     def service_logs(self, minion_id, service, lines=50):
         """Get recent journal logs for a service."""
-        print("[DEBUG] salt_api: service_logs minion=%s service=%s" % (minion_id, service))
+        logger.debug("salt_api: service_logs minion=%s service=%s", minion_id, service)
         cmd = f"journalctl -u {service} -n {lines} --no-pager"
         try:
             return self._call(minion_id, "cmd.run", [cmd])

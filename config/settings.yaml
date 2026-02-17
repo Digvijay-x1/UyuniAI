@@ -27,8 +27,11 @@ thresholds:
 
 llm:
   provider: "huggingface"  # "openai", "google_genai", or "huggingface"
-  model: "Qwen/Qwen2.5-7B-Instruct"
+  model: "Qwen/Qwen3-32B"
   # api_key loaded from env: LLM_API_KEY
+
+logging:
+  level: "DEBUG"
 
 polling:
   interval_seconds: 60
