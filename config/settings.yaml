@@ -30,5 +30,8 @@ llm:
   model: "Qwen/Qwen2.5-7B-Instruct"
   # api_key loaded from env: LLM_API_KEY
 
+logging:
+  level: "DEBUG"  
+
 polling:
   interval_seconds: 60
