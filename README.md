@@ -26,7 +26,7 @@ Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertM
 # Build the agent container
 
 podman build -t uyuni-ai-agent -f Containerfile .
-# Remove --dry-run to send real alerts to AlertManager
+# Remove --dry-run to send real alerts to AlertManager; also, the project assumes that you have a "agent" name in the config of salt-api and you are putting its password
 podman run -d --name ai-agent --network=container:uyuni-server -e LLM_API_KEY="your_key" -e SALT_API_PASSWORD="your_salt_password" uyuni-ai-agent --dry-run
 
 ```
