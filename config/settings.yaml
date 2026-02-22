@@ -13,6 +13,8 @@ salt_api:
 minions:
   - id: "SaltClient"
     instance: "SaltClient:9100"
+    apache_instance: "SaltClient:9117"
+    postgres_instance: "SaltClient:9187"
 
 thresholds:
   memory:
@@ -24,6 +26,20 @@ thresholds:
   disk:
     warning: 85
     critical: 95
+  apache:
+    busy_workers_percent:
+      warning: 75
+      critical: 90
+    requests_per_sec:
+      warning: 500
+      critical: 1000
+  postgres:
+    active_connections_percent:
+      warning: 75
+      critical: 90
+    deadlocks_per_min:
+      warning: 1
+      critical: 5
 
 llm:
   provider: "huggingface"  # "openai", "google_genai", or "huggingface"

@@ -7,10 +7,18 @@ from uyuni_ai_agent.tools.process_tools import get_top_memory_processes, get_top
 from uyuni_ai_agent.tools.disk_tools import get_disk_usage, find_large_files
 from uyuni_ai_agent.tools.service_tools import get_service_status, get_service_logs
 from uyuni_ai_agent.tools.network_tools import check_connectivity, get_listening_ports
+from uyuni_ai_agent.tools.apache_tools import (
+    get_apache_status, get_apache_error_log, get_apache_access_log, get_apache_config_check,
+)
+from uyuni_ai_agent.tools.postgres_tools import (
+    get_postgres_active_queries, get_postgres_locks,
+    get_postgres_connections, get_postgres_log,
+)
 
 
 # All Salt inspection tools available to the agent
 ALL_TOOLS = [
+    # System tools
     get_top_memory_processes,
     get_top_cpu_processes,
     get_disk_usage,
@@ -19,6 +27,16 @@ ALL_TOOLS = [
     get_service_logs,
     check_connectivity,
     get_listening_ports,
+    # Apache tools
+    get_apache_status,
+    get_apache_error_log,
+    get_apache_access_log,
+    get_apache_config_check,
+    # PostgreSQL tools
+    get_postgres_active_queries,
+    get_postgres_locks,
+    get_postgres_connections,
+    get_postgres_log,
 ]
 
 
@@ -40,12 +58,17 @@ def get_prompt_for_anomaly(anomaly, metrics):
         "memory": "high_ram.md",
         "cpu": "high_cpu.md",
         "disk": "disk_full.md",
+        "apache_busy_workers": "apache_overload.md",
+        "apache_requests": "apache_overload.md",
+        "postgres_connections": "postgres_issues.md",
+        "postgres_deadlocks": "postgres_issues.md",
     }
     template_name = template_map.get(anomaly.metric_name, "high_ram.md")
     return load_prompt(
         template_name,
         minion_id=anomaly.minion_id,
         instance=anomaly.minion_id,
+        metric_name=anomaly.metric_name,
         current_value=f"{anomaly.current_value:.1f}",
         threshold=f"{anomaly.threshold:.1f}",
         severity=anomaly.severity.value,

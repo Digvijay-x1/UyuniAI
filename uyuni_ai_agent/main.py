@@ -40,19 +40,37 @@ def run(dry_run=False):
         for minion in config["minions"]:
             instance = minion["instance"]
             minion_id = minion["id"]
+            apache_instance = minion.get("apache_instance")
+            postgres_instance = minion.get("postgres_instance")
 
             logger.info("--- Checking %s (%s) ---", minion_id, instance)
 
             # Step 1: INGEST
             logger.debug("Step 1: querying Prometheus...")
             try:
-                metrics = get_all_metrics(instance)
+                metrics = get_all_metrics(
+                    instance,
+                    apache_instance=apache_instance,
+                    postgres_instance=postgres_instance,
+                )
                 logger.info(
                     "Metrics: mem=%.1f%%, cpu=%.1f%%, disk=%.1f%%",
                     metrics['memory_percent'],
                     metrics['cpu_percent'],
                     metrics['disk_percent'],
                 )
+                if apache_instance:
+                    logger.info(
+                        "Apache: busy_workers=%.1f%%, req/s=%.1f",
+                        metrics.get('apache_busy_workers_percent', 0),
+                        metrics.get('apache_requests_per_sec', 0),
+                    )
+                if postgres_instance:
+                    logger.info(
+                        "PostgreSQL: connections=%.1f%%, deadlocks/min=%.1f",
+                        metrics.get('postgres_active_connections_percent', 0),
+                        metrics.get('postgres_deadlocks_per_min', 0),
+                    )
             except Exception as e:
                 logger.error("Prometheus query failed: %s", e, exc_info=True)
                 continue
@@ -60,7 +78,11 @@ def run(dry_run=False):
             # Step 2: DETECT
             logger.debug("Step 2: checking thresholds...")
             try:
-                anomalies = check_all_metrics(instance, minion_id)
+                anomalies = check_all_metrics(
+                    instance, minion_id,
+                    apache_instance=apache_instance,
+                    postgres_instance=postgres_instance,
+                )
                 logger.debug("Found %d anomalies", len(anomalies))
             except Exception as e:
                 logger.error("Anomaly detection failed: %s", e, exc_info=True)
