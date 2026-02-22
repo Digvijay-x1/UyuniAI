@@ -42,8 +42,8 @@ thresholds:
       critical: 5
 
 llm:
-  provider: "huggingface"  # "openai", "google_genai", or "huggingface"
-  model: "Qwen/Qwen3-32B"
+  provider: "google_genai"  # "openai", "google_genai", or "huggingface"
+  model: "gemini-3-flash-preview"
   # api_key loaded from env: LLM_API_KEY
 
 logging:

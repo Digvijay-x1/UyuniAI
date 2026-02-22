@@ -132,30 +132,33 @@ def get_apache_requests_per_sec(instance):
 # ── PostgreSQL Exporter Metrics ──
 
 def get_postgres_active_connections_percent(instance):
-    """Get active PostgreSQL connections as a percentage of max_connections.
+    """Get total PostgreSQL connections as a percentage of max_connections.
 
-    Uses pg_stat_activity and pg_settings from the postgres_exporter on :9187.
+    Uses sum(pg_stat_database_numbackends) for total connections and
+    pg_settings_max_connections from the postgres_exporter on :9187.
+    Counts ALL connections (active + idle + idle-in-transaction) since
+    connection exhaustion is the real concern regardless of state.
     """
-    active_query = (
-        f'pg_stat_activity_count{{instance="{instance}",state="active"}}'
+    backends_query = (
+        f'sum(pg_stat_database_numbackends{{instance="{instance}"}})'   
     )
     max_query = (
         f'pg_settings_max_connections{{instance="{instance}"}}'
     )
 
-    active_result = query_prometheus(active_query)
+    backends_result = query_prometheus(backends_query)
     max_result = query_prometheus(max_query)
 
-    active = 0.0
+    backends = 0.0
     max_conn = 100.0  # safe default
-    if isinstance(active_result, list) and active_result:
-        active = float(active_result[0]['value'][1])
+    if isinstance(backends_result, list) and backends_result:
+        backends = float(backends_result[0]['value'][1])
     if isinstance(max_result, list) and max_result:
         max_conn = float(max_result[0]['value'][1])
 
     if max_conn == 0:
         return 0.0
-    return (active / max_conn) * 100
+    return (backends / max_conn) * 100
 
 
 def get_postgres_deadlocks_per_min(instance):

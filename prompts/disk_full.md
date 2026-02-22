@@ -1,4 +1,4 @@
-A high disk usage anomaly has been detected.
+High disk usage detected on {minion_id}.
 
 ## Alert Details
 - Server: {minion_id}
@@ -10,10 +10,10 @@ A high disk usage anomaly has been detected.
 ## Current Prometheus Metrics
 {metrics}
 
-## Investigation Instructions
-1. Use get_disk_usage to check which partitions are filling up
-2. Use find_large_files to identify what is consuming disk space
-3. Check for log files that may have grown excessively
-4. Look for old backups or temp files that can be cleaned
+## Investigation Steps (mandatory)
 
-Provide your root cause analysis and remediation steps.
+CALL get_disk_usage with minion_id="{minion_id}" — check which partitions are filling up.
+CALL find_large_files with minion_id="{minion_id}" — find the biggest space consumers.
+If log files are the culprit, CALL get_service_logs for the relevant service to understand why logs are growing.
+
+Look for: runaway log files, old backups not cleaned up, large core dumps, or /tmp filling up.

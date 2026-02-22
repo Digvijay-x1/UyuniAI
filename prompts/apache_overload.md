@@ -1,21 +1,20 @@
-**Apache Overload Alert on `{minion_id}`**
+Apache overload detected on {minion_id}.
 
-**Anomaly:** {metric_name} is at **{current_value}** (threshold: {threshold}, severity: {severity})
+## Alert Details
+- Server: {minion_id}
+- Metric: {metric_name}
+- Current Value: {current_value}
+- Threshold: {threshold}
+- Severity: {severity}
 
-**Current System Metrics:**
+## Current Prometheus Metrics
 {metrics}
 
-Investigate this Apache issue on the server. Use the available tools:
+## Investigation Steps (mandatory)
 
-1. **get_apache_status** — Check `server-status` for BusyWorkers, IdleWorkers, requests/sec, and scoreboard
-2. **get_top_cpu_processes** / **get_top_memory_processes** — See if Apache or related processes are consuming resources
-3. **get_apache_error_log** — Check for module errors, segfaults, or AH* error codes
-4. **get_apache_access_log** — Look for traffic spikes, DDoS patterns, or runaway bots
-5. **get_apache_config_check** — Check if MaxRequestWorkers is too low or configuration has errors
+CALL get_apache_status with minion_id="{minion_id}" — get BusyWorkers, IdleWorkers, requests/sec, and scoreboard state.
+CALL get_apache_error_log with minion_id="{minion_id}" — check for module errors, segfaults, or AH* error codes.
+CALL get_top_cpu_processes with minion_id="{minion_id}" — confirm whether Apache processes are the CPU/memory consumers.
+If the error log shows config issues, CALL get_apache_config_check with minion_id="{minion_id}" to verify MaxRequestWorkers and MPM settings.
 
-Common root causes to look for:
-- Traffic spike overwhelming worker capacity
-- Slow backend (PHP/CGI) causing workers to stay busy
-- MaxRequestWorkers set too low for current load
-- Memory leak in Apache modules causing workers to grow
-- DDoS or bot traffic flooding the server
+Look for: traffic spikes overwhelming workers, slow backends (PHP/CGI) holding workers busy, MaxRequestWorkers too low, DDoS or bot floods, or memory leaks in Apache modules.

@@ -1,4 +1,4 @@
-A service appears to be down or unresponsive.
+A service appears to be down or unresponsive on {minion_id}.
 
 ## Alert Details
 - Server: {minion_id}
@@ -9,10 +9,10 @@ A service appears to be down or unresponsive.
 ## Current Prometheus Metrics
 {metrics}
 
-## Investigation Instructions
-1. Use get_service_status to confirm the service state
-2. Use get_service_logs to check for crash logs or error messages
-3. Use get_listening_ports to verify if the service port is still open
-4. Check if related services or dependencies are also affected
+## Investigation Steps (mandatory)
 
-Provide your root cause analysis and remediation steps.
+CALL get_service_status with minion_id="{minion_id}" and service_name="{service_name}" — confirm the service state.
+CALL get_service_logs with minion_id="{minion_id}" and service_name="{service_name}" — check for crash logs or error messages.
+CALL get_listening_ports with minion_id="{minion_id}" — verify if the service port is still open or something else took it.
+
+Look for: crash loops (repeated start/stop), dependency failures, port conflicts, OOM kills, or config errors after a recent change.
