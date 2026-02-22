@@ -107,6 +107,18 @@ def investigate(anomaly, metrics):
         ]
     })
 
-    # Extract the final response
+    # Extract the final response.
+    # Some LLMs (Gemini) return content as a list of blocks
     final_message = result["messages"][-1]
-    return final_message.content
+    content = final_message.content
+
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                text_parts.append(block["text"])
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return "\n".join(text_parts)
+
+    return content
