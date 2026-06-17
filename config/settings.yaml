@@ -18,13 +18,13 @@ minions:
 
 thresholds:
   memory:
-    warning: 80
+    warning: 70
     critical: 95
   cpu:
-    warning: 80
+    warning: 70
     critical: 95
   disk:
-    warning: 85
+    warning: 75
     critical: 95
   apache:
     busy_workers_percent:
@@ -43,7 +43,7 @@ thresholds:
 
 llm:
   provider: "tokenrouter"  # "openai", "google_genai", or "huggingface"
-  model: "x-ai/grok-4.1-fast"
+  model: "openai/gpt-oss-120b"
   # api_key loaded from env: LLM_API_KEY
 
 logging:
