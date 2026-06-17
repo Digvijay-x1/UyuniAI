@@ -1,8 +1,8 @@
 prometheus:
-  url: "http://167.71.227.138:9090"
+  url: "http://52.91.91.80:9090"
 
 alertmanager:
-  url: "http://167.71.227.138:9093"
+  url: "http://52.91.91.80:9093"
 
 salt_api:
   url: "https://localhost:9080"
@@ -11,10 +11,10 @@ salt_api:
   eauth: "file"
 
 minions:
-  - id: "SaltClient"
-    instance: "SaltClient:9100"
-    apache_instance: "SaltClient:9117"
-    postgres_instance: "SaltClient:9187"
+  - id: "ec2-54-87-17-226.compute-1.amazonaws.com"
+    instance: "client2.digvijayrawat.me:9100"
+    apache_instance: "client2.digvijayrawat.me:9117"
+    postgres_instance: "client2.digvijayrawat.me:9187"
 
 thresholds:
   memory:
@@ -42,8 +42,8 @@ thresholds:
       critical: 5
 
 llm:
-  provider: "google_genai"  # "openai", "google_genai", or "huggingface"
-  model: "gemini-3-flash-preview"
+  provider: "tokenrouter"  # "openai", "google_genai", or "huggingface"
+  model: "x-ai/grok-4.1-fast"
   # api_key loaded from env: LLM_API_KEY
 
 logging:
