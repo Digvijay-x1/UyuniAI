@@ -1,13 +1,19 @@
 import os
-from uyuni_ai_agent.config import load_config
 
 
-def get_llm():
-    """Return a configured LangChain chat LLM based on settings.yaml.
-    Supports: huggingface, google_genai, openai.
-    API key is read from the LLM_API_KEY environment variable.
+def get_llm(config):
+    """Return a configured LangChain chat LLM based on the passed config.
+
+    Supports: huggingface, google_genai, openai, tokenrouter.
+    The API key is read from config["llm"]["api_key"] (populated from the
+    LLM_API_KEY env var by load_config()) with an env fallback.
+
+    This function stays synchronous on purpose: chat-model constructors are
+    sync, and every returned class supports async invocation (ainvoke)
+    natively. If the "huggingface" provider is ever used and ainvoke is
+    unsupported by the installed langchain-huggingface version, fall back to
+    asyncio.to_thread(llm.invoke, ...) at the call site (investigate).
     """
-    config = load_config()
     provider = config["llm"]["provider"]
     model = config["llm"]["model"]
     api_key = config["llm"].get("api_key", os.environ.get("LLM_API_KEY", ""))
