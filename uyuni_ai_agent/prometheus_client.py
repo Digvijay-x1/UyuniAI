@@ -1,16 +1,11 @@
 import logging
-import requests
-from datetime import datetime, timedelta
-
-from uyuni_ai_agent.config import load_config
 
 logger = logging.getLogger(__name__)
 
 
-def query_prometheus(prom_ql):
+async def query_prometheus(prom_ql, client, prometheus_url):
     """Execute an instant PromQL query and return the results."""
-    config = load_config()
-    URL = f"{config['prometheus']['url']}/api/v1/query"
+    URL = f"{prometheus_url}/api/v1/query"
     logger.debug("querying prometheus: %s query=%s", URL, prom_ql[:80])
 
     params = {
@@ -18,7 +13,7 @@ def query_prometheus(prom_ql):
     }
 
     try:
-        response = requests.get(URL, params=params, timeout=10)
+        response = await client.get(URL, params=params, timeout=10)
         if response.status_code == 200:
             results = response.json()['data']['result']
             return results
@@ -28,10 +23,9 @@ def query_prometheus(prom_ql):
         return f"Connection Failed: {str(e)}"
 
 
-def query_prometheus_range(prom_ql, start, end, step="1m"):
+async def query_prometheus_range(prom_ql, start, end, client, prometheus_url, step="1m"):
     """Execute a range PromQL query over a time window."""
-    config = load_config()
-    URL = f"{config['prometheus']['url']}/api/v1/query_range"
+    URL = f"{prometheus_url}/api/v1/query_range"
 
     params = {
         'query': prom_ql,
@@ -41,7 +35,7 @@ def query_prometheus_range(prom_ql, start, end, step="1m"):
     }
 
     try:
-        response = requests.get(URL, params=params, timeout=10)
+        response = await client.get(URL, params=params, timeout=10)
         if response.status_code == 200:
             return response.json()['data']['result']
         else:
@@ -52,31 +46,31 @@ def query_prometheus_range(prom_ql, start, end, step="1m"):
 
 # ── Node Exporter Metrics ──
 
-def get_memory_usage_percent(instance):
+async def get_memory_usage_percent(instance, client, prometheus_url):
     """Get current memory usage percentage for an instance."""
     query = (
         f'100 - (node_memory_MemAvailable_bytes{{instance="{instance}"}} '
         f'/ node_memory_MemTotal_bytes{{instance="{instance}"}} * 100)'
     )
-    result = query_prometheus(query)
+    result = await query_prometheus(query, client, prometheus_url)
     if isinstance(result, list) and result:
         return float(result[0]['value'][1])
     return 0.0
 
 
-def get_cpu_usage_percent(instance):
+async def get_cpu_usage_percent(instance, client, prometheus_url):
     """Get current CPU usage percentage for an instance."""
     query = (
         f'100 - (avg(irate(node_cpu_seconds_total'
         f'{{instance="{instance}",mode="idle"}}[5m])) * 100)'
     )
-    result = query_prometheus(query)
+    result = await query_prometheus(query, client, prometheus_url)
     if isinstance(result, list) and result:
         return float(result[0]['value'][1])
     return 0.0
 
 
-def get_disk_usage_percent(instance, mountpoint="/"):
+async def get_disk_usage_percent(instance, client, prometheus_url, mountpoint="/"):
     """Get disk usage percentage for a mountpoint on an instance."""
     query = (
         f'100 - (node_filesystem_avail_bytes'
@@ -84,7 +78,7 @@ def get_disk_usage_percent(instance, mountpoint="/"):
         f'/ node_filesystem_size_bytes'
         f'{{instance="{instance}",mountpoint="{mountpoint}"}} * 100)'
     )
-    result = query_prometheus(query)
+    result = await query_prometheus(query, client, prometheus_url)
     if isinstance(result, list) and result:
         return float(result[0]['value'][1])
     return 0.0
@@ -92,7 +86,7 @@ def get_disk_usage_percent(instance, mountpoint="/"):
 
 # ── Apache Exporter Metrics ──
 
-def get_apache_busy_workers_percent(instance):
+async def get_apache_busy_workers_percent(instance, client, prometheus_url):
     """Get Apache busy workers as a percentage of total workers.
 
     Uses apache_workers{state="busy"} / (busy + idle) * 100
@@ -101,8 +95,8 @@ def get_apache_busy_workers_percent(instance):
     busy_query = f'apache_workers{{instance="{instance}",state="busy"}}'
     idle_query = f'apache_workers{{instance="{instance}",state="idle"}}'
 
-    busy_result = query_prometheus(busy_query)
-    idle_result = query_prometheus(idle_query)
+    busy_result = await query_prometheus(busy_query, client, prometheus_url)
+    idle_result = await query_prometheus(idle_query, client, prometheus_url)
 
     busy = 0.0
     idle = 0.0
@@ -117,13 +111,13 @@ def get_apache_busy_workers_percent(instance):
     return (busy / total) * 100
 
 
-def get_apache_requests_per_sec(instance):
+async def get_apache_requests_per_sec(instance, client, prometheus_url):
     """Get Apache request rate (requests per second over 5m window).
 
     Uses rate(apache_accesses_total[5m]) from the apache_exporter.
     """
     query = f'rate(apache_accesses_total{{instance="{instance}"}}[5m])'
-    result = query_prometheus(query)
+    result = await query_prometheus(query, client, prometheus_url)
     if isinstance(result, list) and result:
         return float(result[0]['value'][1])
     return 0.0
@@ -131,7 +125,7 @@ def get_apache_requests_per_sec(instance):
 
 # ── PostgreSQL Exporter Metrics ──
 
-def get_postgres_active_connections_percent(instance):
+async def get_postgres_active_connections_percent(instance, client, prometheus_url):
     """Get total PostgreSQL connections as a percentage of max_connections.
 
     Uses sum(pg_stat_database_numbackends) for total connections and
@@ -140,14 +134,14 @@ def get_postgres_active_connections_percent(instance):
     connection exhaustion is the real concern regardless of state.
     """
     backends_query = (
-        f'sum(pg_stat_database_numbackends{{instance="{instance}"}})'   
+        f'sum(pg_stat_database_numbackends{{instance="{instance}"}})'
     )
     max_query = (
         f'pg_settings_max_connections{{instance="{instance}"}}'
     )
 
-    backends_result = query_prometheus(backends_query)
-    max_result = query_prometheus(max_query)
+    backends_result = await query_prometheus(backends_query, client, prometheus_url)
+    max_result = await query_prometheus(max_query, client, prometheus_url)
 
     backends = 0.0
     max_conn = 100.0  # safe default
@@ -161,7 +155,7 @@ def get_postgres_active_connections_percent(instance):
     return (backends / max_conn) * 100
 
 
-def get_postgres_deadlocks_per_min(instance):
+async def get_postgres_deadlocks_per_min(instance, client, prometheus_url):
     """Get PostgreSQL deadlock rate (deadlocks per minute over 5m window).
 
     Uses rate(pg_stat_database_deadlocks[5m]) * 60 from the postgres_exporter.
@@ -169,7 +163,7 @@ def get_postgres_deadlocks_per_min(instance):
     query = (
         f'sum(rate(pg_stat_database_deadlocks{{instance="{instance}"}}[5m])) * 60'
     )
-    result = query_prometheus(query)
+    result = await query_prometheus(query, client, prometheus_url)
     if isinstance(result, list) and result:
         return float(result[0]['value'][1])
     return 0.0
@@ -177,24 +171,35 @@ def get_postgres_deadlocks_per_min(instance):
 
 # ── Combined Metrics ──
 
-def get_all_metrics(instance, apache_instance=None, postgres_instance=None):
+async def get_all_metrics(instance, client, config, apache_instance=None, postgres_instance=None):
     """Get all key metrics for an instance. Returns a dict summary.
 
     Includes node_exporter metrics always. Apache and PostgreSQL metrics
     are included only if their exporter instances are configured.
+
+    Metrics are fetched sequentially (no inner parallelism).
     """
+    prometheus_url = config["prometheus"]["url"]
     metrics = {
-        "memory_percent": get_memory_usage_percent(instance),
-        "cpu_percent": get_cpu_usage_percent(instance),
-        "disk_percent": get_disk_usage_percent(instance),
+        "memory_percent": await get_memory_usage_percent(instance, client, prometheus_url),
+        "cpu_percent": await get_cpu_usage_percent(instance, client, prometheus_url),
+        "disk_percent": await get_disk_usage_percent(instance, client, prometheus_url),
     }
 
     if apache_instance:
-        metrics["apache_busy_workers_percent"] = get_apache_busy_workers_percent(apache_instance)
-        metrics["apache_requests_per_sec"] = get_apache_requests_per_sec(apache_instance)
+        metrics["apache_busy_workers_percent"] = await get_apache_busy_workers_percent(
+            apache_instance, client, prometheus_url
+        )
+        metrics["apache_requests_per_sec"] = await get_apache_requests_per_sec(
+            apache_instance, client, prometheus_url
+        )
 
     if postgres_instance:
-        metrics["postgres_active_connections_percent"] = get_postgres_active_connections_percent(postgres_instance)
-        metrics["postgres_deadlocks_per_min"] = get_postgres_deadlocks_per_min(postgres_instance)
+        metrics["postgres_active_connections_percent"] = await get_postgres_active_connections_percent(
+            postgres_instance, client, prometheus_url
+        )
+        metrics["postgres_deadlocks_per_min"] = await get_postgres_deadlocks_per_min(
+            postgres_instance, client, prometheus_url
+        )
 
     return metrics

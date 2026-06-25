@@ -1,4 +1,6 @@
 import os
+import logging
+
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage
 
@@ -14,6 +16,8 @@ from uyuni_ai_agent.tools.postgres_tools import (
     get_postgres_active_queries, get_postgres_locks,
     get_postgres_connections, get_postgres_log,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # All Salt inspection tools available to the agent
@@ -38,6 +42,31 @@ ALL_TOOLS = [
     get_postgres_connections,
     get_postgres_log,
 ]
+
+
+# Compiled agent cache, keyed by (provider, model). The chat-model constructor
+# (e.g. ChatOpenAI) opens its own httpx client pool, and LangGraph compilation is
+# non-trivial — both should happen once, not on every investigate() call (which
+# fires per anomaly, per minion, per cycle). The ReAct agent is stateless across
+# invocations (each ainvoke gets fresh messages), so reuse is safe.
+_agent_cache = {}
+
+
+def get_agent(config):
+    """Return the shared, compiled ReAct agent for this provider/model.
+
+    Builds and caches the LLM + agent graph on first use. Keyed on
+    (provider, model) since the api key is resolved once at load_config() and
+    does not change for the process lifetime.
+    """
+    cache_key = (config["llm"]["provider"], config["llm"]["model"])
+    agent = _agent_cache.get(cache_key)
+    if agent is None:
+        llm = get_llm(config)
+        agent = create_react_agent(llm, ALL_TOOLS)
+        _agent_cache[cache_key] = agent
+        logger.info("Compiled ReAct agent for provider=%s model=%s", *cache_key)
+    return agent
 
 
 def load_prompt(template_name, **kwargs):
@@ -76,7 +105,7 @@ def get_prompt_for_anomaly(anomaly, metrics):
     )
 
 
-def investigate(anomaly, metrics):
+async def investigate(anomaly, metrics, config):
     """Run the ReAct agent to investigate an anomaly.
     The agent uses Salt tools to gather context and the LLM to reason
     about the root cause.
@@ -84,11 +113,14 @@ def investigate(anomaly, metrics):
     Args:
         anomaly: an Anomaly dataclass from anomaly_detector
         metrics: dict of current Prometheus metrics
+        config: the loaded settings dict (passed to get_llm)
 
     Returns:
         str: the AI-generated root cause analysis
     """
-    llm = get_llm()
+    # Reuse the compiled agent + LLM client (built once, cached) instead of
+    # reconstructing both on every call. Only the messages vary per anomaly.
+    agent = get_agent(config)
 
     # Load system prompt
     system_prompt = load_prompt("system_prompt.md")
@@ -96,11 +128,8 @@ def investigate(anomaly, metrics):
     # Load scenario-specific prompt
     scenario_prompt = get_prompt_for_anomaly(anomaly, metrics)
 
-    # Create the ReAct agent with all Salt tools
-    agent = create_react_agent(llm, ALL_TOOLS)
-
-    # Run the agent
-    result = agent.invoke({
+    # Run the agent (async; async tools are awaited by the ReAct tool node)
+    result = await agent.ainvoke({
         "messages": [
             SystemMessage(content=system_prompt),
             ("human", scenario_prompt),
@@ -108,17 +137,42 @@ def investigate(anomaly, metrics):
     })
 
     # Extract the final response.
-    # Some LLMs (Gemini) return content as a list of blocks
+    # LLMs may return content as a string or as a list of blocks. Block shapes
+    # vary by provider: {"type": "text", "text": ...}, plain strings, AIMessageChunk
+    # objects, or tool-use blocks (which carry no readable text). We extract every
+    # readable fragment and warn if the final answer ends up empty so the alert is
+    # never filed with a blank description.
     final_message = result["messages"][-1]
     content = final_message.content
 
     if isinstance(content, list):
         text_parts = []
         for block in content:
-            if isinstance(block, dict) and "text" in block:
-                text_parts.append(block["text"])
-            elif isinstance(block, str):
+            if isinstance(block, str):
                 text_parts.append(block)
-        return "\n".join(text_parts)
+            elif isinstance(block, dict):
+                # {"type": "text", "text": "..."} or {"text": "..."}
+                if block.get("type") == "text" and "text" in block:
+                    text_parts.append(block["text"])
+                elif "text" in block:
+                    text_parts.append(block["text"])
+                elif block.get("type") == "tool_use":
+                    logger.debug("Skipping tool_use block in final message")
+                else:
+                    logger.warning("Unrecognized content block shape: %r", block)
+            else:
+                # Objects with a .content attribute (e.g. AIMessageChunk); fall
+                # back to str() so we never silently drop something readable.
+                logger.debug("Non-dict/str content block of type %s", type(block).__name__)
+                text_parts.append(str(block))
+        text = "\n".join(text_parts).strip()
+        if not text:
+            logger.warning("LLM returned no readable text content; blocks: %r", content)
+        return text
 
-    return content
+    if isinstance(content, str):
+        return content.strip()
+
+    # Unexpected scalar type (bytes, None, etc.)
+    logger.warning("Unexpected content type %s: %r", type(content).__name__, content)
+    return str(content)

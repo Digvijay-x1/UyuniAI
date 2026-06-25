@@ -1,19 +1,19 @@
 from langchain_core.tools import tool
 
-from uyuni_ai_agent.salt_api import salt_client
+from uyuni_ai_agent import salt_api
 
 
 @tool
-def get_disk_usage(minion_id: str) -> str:
+async def get_disk_usage(minion_id: str) -> str:
     """Get disk usage summary for all mounted filesystems on a minion.
     Use this when you detect high disk usage and need to see which
     partitions are filling up.
     """
-    return salt_client.disk_usage(minion_id)
+    return await salt_api.salt_client.disk_usage(minion_id)
 
 
 @tool
-def find_large_files(minion_id: str, path: str = "/", min_size: str = "100M") -> str:
+async def find_large_files(minion_id: str, path: str = "/", min_size: str = "100M") -> str:
     """Find files larger than a specified size on a minion.
     Use this to identify what is consuming disk space.
     Args:
@@ -22,4 +22,4 @@ def find_large_files(minion_id: str, path: str = "/", min_size: str = "100M") ->
         min_size: minimum file size to report (default: 100M)
     """
     cmd = f"find {path} -type f -size +{min_size} 2>/dev/null | head -20"
-    return salt_client.run_command(minion_id, cmd)
+    return await salt_api.salt_client.run_command(minion_id, cmd)
