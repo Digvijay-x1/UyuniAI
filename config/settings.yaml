@@ -51,3 +51,8 @@ logging:
 
 polling:
   interval_seconds: 60
+
+concurrency:
+  max_minions: 8       # minions processed in parallel per cycle
+  max_salt_calls: 8   # global cap on concurrent Salt API calls
+  max_llm_calls: 5     # cap on concurrent LLM investigations

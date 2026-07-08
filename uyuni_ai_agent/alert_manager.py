@@ -1,20 +1,18 @@
-import requests
 import datetime
 
-from uyuni_ai_agent.config import load_config
-
 # Ref: https://prometheus.io/docs/alerting/latest/alerts_api/
-def send_to_alertmanager(summary, description, severity="info", minion_id="", metric_name=""):
+async def send_to_alertmanager(client, config, summary, description, severity="info", minion_id="", metric_name=""):
     """Send an enriched alert to AlertManager.
-    
+
     Args:
+        client: an httpx.AsyncClient used for the POST
+        config: the loaded settings dict (provides alertmanager.url)
         summary: one-line summary of the issue
         description: full AI-generated root cause analysis
         severity: alert severity (info, warning, critical)
         minion_id: the affected minion
         metric_name: the metric that triggered the alert
     """
-    config = load_config()
     URL = f"{config['alertmanager']['url']}/api/v2/alerts"
 
     payload = [{
@@ -33,7 +31,7 @@ def send_to_alertmanager(summary, description, severity="info", minion_id="", me
     }]
 
     try:
-        response = requests.post(URL, json=payload)
+        response = await client.post(URL, json=payload)
         if response.status_code == 200:
             return "Success: Message routed through Alertmanager."
         else:
