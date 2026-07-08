@@ -26,12 +26,16 @@ async def process_minion(minion, http_client, config, dry_run, minion_sem, llm_s
     are bounded by ``llm_sem``. Salt API calls are throttled separately inside
     the SaltAPIClient so the Salt Master is not overwhelmed during alert storms.
     """
-    instance = minion["instance"]
-    minion_id = minion["id"]
-    apache_instance = minion.get("apache_instance")
-    postgres_instance = minion.get("postgres_instance")
-
     try:
+        # Read required keys inside the try so a malformed minion entry
+        # (missing "instance"/"id") raises a KeyError that is isolated to this
+        # minion instead of bubbling out of asyncio.gather() and aborting the
+        # whole polling cycle.
+        instance = minion["instance"]
+        minion_id = minion["id"]
+        apache_instance = minion.get("apache_instance")
+        postgres_instance = minion.get("postgres_instance")
+
         async with minion_sem:
             logger.info("--- Checking %s (%s) ---", minion_id, instance)
 
@@ -114,7 +118,8 @@ async def process_minion(minion, http_client, config, dry_run, minion_sem, llm_s
                     )
                     logger.info("AlertManager: %s", result)
     except Exception as e:
-        logger.error("Minion %s processing failed: %s", minion_id, e, exc_info=True)
+        failed_id = minion.get("id", "<unknown>") if isinstance(minion, dict) else "<unknown>"
+        logger.error("Minion %s processing failed: %s", failed_id, e, exc_info=True)
 
 
 async def run(dry_run=False):
@@ -147,10 +152,6 @@ async def run(dry_run=False):
     minion_sem = asyncio.Semaphore(max_minions)
     llm_sem = asyncio.Semaphore(max_llm_calls)
 
-    # Graceful shutdown: SIGTERM (e.g. `docker stop`) asks the loop to exit
-    # after the current cycle. SIGINT (Ctrl-C) is left to raise
-    # KeyboardInterrupt for an immediate exit during local development.
-    # add_signal_handler is POSIX-only; on Windows we rely on KeyboardInterrupt.
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     if os.name != "nt":
