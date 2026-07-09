@@ -1,0 +1,63 @@
+{{/*
+  Notification templates for the Uyuni AI Monitoring Agent.
+
+  These render the structured annotations the agent attaches to each alert
+  (root_cause, key_evidence, remediation, urgency, confidence, ...).
+
+  Install alongside alertmanager.yml, e.g.:
+    /etc/alertmanager/templates/ai_agent.tmpl
+  and reference the templates dir in alertmanager.yml:
+    templates:
+      - "/etc/alertmanager/templates/*.tmpl"
+*/}}
+
+{{/* ── Slack title ─────────────────────────────────────────────────────── */}}
+{{ define "ai_agent.slack.title" -}}
+{{ if eq .Status "firing" }} {{ else }} {{ end }} [{{ .Status | toUpper }}] AI Agent: {{ .CommonAnnotations.summary }}
+{{- end }}
+
+{{/* ── Slack body ──────────────────────────────────────────────────────── */}}
+{{ define "ai_agent.slack.text" -}}
+{{ range .Alerts }}
+*Minion:* {{ .Labels.minion }}   *Metric:* {{ .Labels.metric }}   *Severity:* {{ .Labels.severity }}
+*Urgency:* {{ .Annotations.urgency }}   *Confidence:* {{ .Annotations.confidence }}
+
+*Root Cause*
+{{ .Annotations.root_cause }}
+
+*Affected Component*
+{{ .Annotations.affected_component }}
+
+{{ if .Annotations.key_evidence -}}
+*Key Evidence*
+{{ .Annotations.key_evidence }}
+{{ end }}
+{{- if .Annotations.remediation -}}
+*Remediation*
+{{ .Annotations.remediation }}
+{{ end }}
+{{ if .GeneratorURL }}<{{ .GeneratorURL }}|Source>{{ end }}
+{{ end }}
+{{- end }}
+
+{{/* ── Generic email/webhook body (plain text) ─────────────────────────── */}}
+{{ define "ai_agent.text" -}}
+{{ range .Alerts }}
+[{{ .Status | toUpper }}] {{ .Annotations.summary }}
+Minion: {{ .Labels.minion }} | Metric: {{ .Labels.metric }} | Severity: {{ .Labels.severity }}
+Urgency: {{ .Annotations.urgency }} | Confidence: {{ .Annotations.confidence }}
+
+Root Cause:
+  {{ .Annotations.root_cause }}
+
+Affected Component:
+  {{ .Annotations.affected_component }}
+
+Key Evidence:
+{{ .Annotations.key_evidence }}
+
+Remediation:
+{{ .Annotations.remediation }}
+---
+{{ end }}
+{{- end }}

@@ -5,6 +5,7 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage
 
 from uyuni_ai_agent.llm_provider import get_llm
+from uyuni_ai_agent.models import RootCauseAnalysis
 from uyuni_ai_agent.tools.process_tools import get_top_memory_processes, get_top_cpu_processes
 from uyuni_ai_agent.tools.disk_tools import get_disk_usage, find_large_files
 from uyuni_ai_agent.tools.service_tools import get_service_status, get_service_logs
@@ -50,6 +51,31 @@ ALL_TOOLS = [
 # fires per anomaly, per minion, per cycle). The ReAct agent is stateless across
 # invocations (each ainvoke gets fresh messages), so reuse is safe.
 _agent_cache = {}
+
+# Structured-output LLM cache, keyed by (provider, model). Built from the same
+# provider/model as the ReAct agent but wrapped with .with_structured_output()
+# so the final formatting pass returns a validated RootCauseAnalysis instead of
+# free text. Cached for the same reason as the agent: the chat-model constructor
+# opens an httpx pool that should be created once, not per investigation.
+_structured_llm_cache = {}
+
+
+def get_structured_llm(config):
+    """Return the shared LLM bound to the RootCauseAnalysis schema.
+
+    Requires a provider/model that supports native json_schema structured
+    output (see structured-output-models.md). ``with_structured_output`` makes
+    the model emit JSON conforming to the Pydantic schema, which LangChain then
+    parses into a RootCauseAnalysis instance.
+    """
+    cache_key = (config["llm"]["provider"], config["llm"]["model"])
+    structured = _structured_llm_cache.get(cache_key)
+    if structured is None:
+        llm = get_llm(config)
+        structured = llm.with_structured_output(RootCauseAnalysis)
+        _structured_llm_cache[cache_key] = structured
+        logger.info("Built structured-output LLM for provider=%s model=%s", *cache_key)
+    return structured
 
 
 def get_agent(config):
@@ -106,9 +132,14 @@ def get_prompt_for_anomaly(anomaly, metrics):
 
 
 async def investigate(anomaly, metrics, config):
-    """Run the ReAct agent to investigate an anomaly.
-    The agent uses Salt tools to gather context and the LLM to reason
-    about the root cause.
+    """Run the ReAct agent to investigate an anomaly, then structure the result.
+
+    Two phases:
+      1. INVESTIGATE -- the ReAct agent calls Salt tools and reasons about the
+         root cause, producing free-form text.
+      2. STRUCTURE   -- a second LLM pass (with_structured_output) converts that
+         reasoning into a validated RootCauseAnalysis so AlertManager receives
+         stable, machine-readable fields instead of one text blob.
 
     Args:
         anomaly: an Anomaly dataclass from anomaly_detector
@@ -116,7 +147,7 @@ async def investigate(anomaly, metrics, config):
         config: the loaded settings dict (passed to get_llm)
 
     Returns:
-        str: the AI-generated root cause analysis
+        RootCauseAnalysis: the validated, structured analysis.
     """
     # Reuse the compiled agent + LLM client (built once, cached) instead of
     # reconstructing both on every call. Only the messages vary per anomaly.
@@ -128,7 +159,7 @@ async def investigate(anomaly, metrics, config):
     # Load scenario-specific prompt
     scenario_prompt = get_prompt_for_anomaly(anomaly, metrics)
 
-    # Run the agent (async; async tools are awaited by the ReAct tool node)
+    # Phase 1: run the ReAct agent (async; async tools are awaited by the tool node)
     result = await agent.ainvoke({
         "messages": [
             SystemMessage(content=system_prompt),
@@ -136,13 +167,43 @@ async def investigate(anomaly, metrics, config):
         ]
     })
 
-    # Extract the final response.
-    # LLMs may return content as a string or as a list of blocks. Block shapes
-    # vary by provider: {"type": "text", "text": ...}, plain strings, AIMessageChunk
-    # objects, or tool-use blocks (which carry no readable text). We extract every
-    # readable fragment and warn if the final answer ends up empty so the alert is
-    # never filed with a blank description.
-    final_message = result["messages"][-1]
+    reasoning = _extract_text(result["messages"][-1])
+
+    # Phase 2: structure the free-form reasoning into RootCauseAnalysis.
+    structured_llm = get_structured_llm(config)
+    structuring_prompt = (
+        "Convert the following investigation into the required structured "
+        "analysis. Use ONLY the information present in the investigation; do "
+        "not invent evidence. If a field cannot be determined, use a clearly "
+        "conservative value (e.g. affected_component='unknown', low "
+        "confidence).\n\n"
+        f"ANOMALY: {anomaly.description} "
+        f"(metric={anomaly.metric_name}, value={anomaly.current_value:.1f}, "
+        f"threshold={anomaly.threshold:.1f}, severity={anomaly.severity.value}, "
+        f"minion={anomaly.minion_id})\n\n"
+        f"INVESTIGATION:\n{reasoning}"
+    )
+    analysis = await structured_llm.ainvoke([
+        SystemMessage(
+            content=(
+                "You format a completed system-administration investigation "
+                "into a structured root-cause analysis."
+            )
+        ),
+        ("human", structuring_prompt),
+    ])
+    return analysis
+
+
+def _extract_text(final_message):
+    """Extract readable text from a LangChain message's ``content``.
+
+    LLMs may return content as a string or a list of blocks. Block shapes vary
+    by provider: {"type": "text", "text": ...}, plain strings, AIMessageChunk
+    objects, or tool-use blocks (which carry no readable text). We extract every
+    readable fragment and warn if the result is empty so the structuring pass is
+    never fed a blank investigation.
+    """
     content = final_message.content
 
     if isinstance(content, list):

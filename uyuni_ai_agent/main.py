@@ -93,25 +93,28 @@ async def process_minion(minion, http_client, config, dry_run, minion_sem, llm_s
 
                 # Step 3: INTELLIGENCE
                 logger.debug("Step 3: running ReAct agent...")
+                analysis = None
                 try:
                     async with llm_sem:
                         analysis = await investigate(anomaly, metrics, config)
-                    logger.info("Analysis:\n%s", analysis)
+                    logger.info("Analysis:\n%s", analysis.to_text())
                 except Exception as e:
                     logger.error("ReAct agent failed: %s", e, exc_info=True)
-                    analysis = f"Agent error: {e}"
 
                 # Step 4: ACTION
-                if dry_run:
+                if analysis is None:
+                    logger.error(
+                        "Skipping alert for %s: investigation produced no analysis.",
+                        anomaly.description,
+                    )
+                elif dry_run:
                     logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
-                    logger.info("[DRY RUN] Analysis: %s", analysis)
+                    logger.info("[DRY RUN] Analysis:\n%s", analysis.to_text())
                 else:
                     logger.debug("Step 4: sending to AlertManager...")
-                    summary = f"{anomaly.metric_name} issue on {anomaly.minion_id}"
                     result = await send_to_alertmanager(
                         http_client, config,
-                        summary=summary,
-                        description=analysis,
+                        analysis,
                         severity=anomaly.severity.value,
                         minion_id=anomaly.minion_id,
                         metric_name=anomaly.metric_name,
