@@ -32,3 +32,10 @@ podman run -d --name ai-agent --network=container:uyuni-server -e LLM_API_KEY="y
 ```
 
 We tested it in a minion and here is the [result](https://github.com/sussysimpai-blip/X-project/wiki/Current-Result-from-the-agent)
+
+
+## License
+
+Copyright 2026 Digvijay Rawat
+
+Licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for the full text.
