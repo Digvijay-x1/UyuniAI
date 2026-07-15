@@ -35,3 +35,19 @@ async def get_top_cpu_processes(minion_id: str, top_n: int = 10) -> str:
     """
     cmd = f"ps aux --sort=-%cpu | head -n {top_n + 1}"
     return await salt_api.salt_client.run_command(minion_id, cmd)
+
+
+@tool
+async def get_memory_pressure_snapshot(minion_id: str) -> str:
+    """Inspect memory availability, active swap I/O, pressure stalls, and RSS.
+
+    This uses a fixed bounded command and intentionally omits process command
+    lines so credentials in arguments are not exposed to the LLM.
+    """
+    return await salt_api.salt_client.memory_pressure_snapshot(minion_id)
+
+
+@tool
+async def get_cpu_pressure_snapshot(minion_id: str) -> str:
+    """Inspect load, per-process CPU, vmstat, CPU PSI, and kernel warnings."""
+    return await salt_api.salt_client.cpu_pressure_snapshot(minion_id)

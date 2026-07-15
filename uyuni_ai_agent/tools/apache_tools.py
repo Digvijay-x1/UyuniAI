@@ -18,6 +18,17 @@ from uyuni_ai_agent import salt_api
 
 
 @tool
+async def get_apache_overload_snapshot(minion_id: str) -> str:
+    """Get bounded evidence that distinguishes traffic from slow backends.
+
+    Returns server-status, recent access-log aggregates without query strings,
+    Apache-related TCP connections, process/systemd ownership, relevant module
+    and proxy configuration, and recent errors.
+    """
+    return await salt_api.salt_client.apache_overload_snapshot(minion_id)
+
+
+@tool
 async def get_apache_status(minion_id: str) -> str:
     """Get Apache server-status output showing workers, requests, and load.
 

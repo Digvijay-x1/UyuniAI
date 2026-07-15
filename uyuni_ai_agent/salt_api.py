@@ -19,6 +19,20 @@ import logging
 
 import httpx
 
+from uyuni_ai_agent.apache_inspection import build_apache_overload_command
+from uyuni_ai_agent.disk_inspection import (
+    build_large_files_command,
+    build_service_references_command,
+)
+from uyuni_ai_agent.postgres_inspection import (
+    build_postgres_blocking_command,
+    build_postgres_connection_activity_command,
+    build_postgres_health_command,
+)
+from uyuni_ai_agent.memory_inspection import build_memory_pressure_command
+from uyuni_ai_agent.cpu_inspection import build_cpu_pressure_command
+from uyuni_ai_agent.systemd import validate_systemd_service
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,8 +95,7 @@ class SaltAPIClient:
         )
         resp.raise_for_status()
         self.logged_in = True
-        token = resp.json()["return"][0]["token"]
-        logger.debug("salt_api: login successful, token=%s...", token[:12])
+        logger.debug("salt_api: login successful")
 
     async def _ensure_login(self):
         """Login if we haven't yet.
@@ -156,20 +169,123 @@ class SaltAPIClient:
 
     async def service_status(self, minion_id, service):
         """Check if a service is running on a minion."""
+        service = validate_systemd_service(service)
         logger.debug("salt_api: service.status minion=%s service=%s", minion_id, service)
         try:
             return await self._call(minion_id, "service.status", [service])
         except Exception as e:
             return f"Salt API call failed: {str(e)}"
 
+    async def largest_files(
+        self, minion_id, path, min_size="10M", limit=20
+    ):
+        """Return a bounded, size-sorted list of files on one filesystem."""
+        return await self.run_command(
+            minion_id,
+            build_large_files_command(path, min_size, limit),
+        )
+
+    async def service_references(self, minion_id, path):
+        """Find systemd unit files that reference an absolute path."""
+        return await self.run_command(
+            minion_id,
+            build_service_references_command(path),
+        )
+
     async def service_logs(self, minion_id, service, lines=50):
         """Get recent journal logs for a service."""
+        service = validate_systemd_service(service)
+        lines = max(1, min(int(lines), 200))
         logger.debug("salt_api: service_logs minion=%s service=%s", minion_id, service)
         cmd = f"journalctl -u {service} -n {lines} --no-pager"
         try:
             return await self._call(minion_id, "cmd.run", [cmd])
         except Exception as e:
             return f"Salt API call failed: {str(e)}"
+
+    async def failed_systemd_services(self, minion_id):
+        """Return failed or auto-restarting services with a fixed command.
+
+        A service with ``Restart=`` may stay in ``activating/auto-restart``
+        forever instead of settling in ``failed``. Both states are therefore
+        queried. The command is intentionally not supplied by the LLM.
+        """
+        cmd = (
+            "systemctl list-units --type=service --state=failed,activating "
+            "--no-legend --no-pager --plain"
+        )
+        logger.debug("salt_api: failed_systemd_services minion=%s", minion_id)
+        try:
+            return await self._call(minion_id, "cmd.run", [cmd])
+        except Exception as e:
+            return f"Salt API call failed: {str(e)}"
+
+    async def service_details(self, minion_id, service):
+        """Return bounded diagnostic properties for one systemd service."""
+        service = validate_systemd_service(service)
+        properties = (
+            "Id,Description,LoadState,ActiveState,SubState,Result,"
+            "ExecMainCode,ExecMainStatus,NRestarts,Restart,FragmentPath,ExecStart"
+        )
+        cmd = (
+            f"systemctl show {service} --no-pager "
+            f"--property={properties}"
+        )
+        logger.debug("salt_api: service_details minion=%s service=%s", minion_id, service)
+        try:
+            return await self._call(minion_id, "cmd.run", [cmd])
+        except Exception as e:
+            return f"Salt API call failed: {str(e)}"
+
+    async def memory_pressure_snapshot(self, minion_id):
+        """Return bounded live memory, swap, CPU, and top-RSS evidence."""
+        logger.debug("salt_api: memory_pressure_snapshot minion=%s", minion_id)
+        return await self.run_command(
+            minion_id,
+            build_memory_pressure_command(),
+        )
+
+    async def cpu_pressure_snapshot(self, minion_id):
+        """Return bounded live load, CPU, process, and PSI evidence."""
+        logger.debug("salt_api: cpu_pressure_snapshot minion=%s", minion_id)
+        return await self.run_command(
+            minion_id,
+            build_cpu_pressure_command(),
+        )
+
+    async def apache_overload_snapshot(self, minion_id):
+        """Return bounded Apache load, traffic, backend, and config evidence."""
+        logger.debug("salt_api: apache_overload_snapshot minion=%s", minion_id)
+        return await self.run_command(
+            minion_id,
+            build_apache_overload_command(),
+        )
+
+    async def postgres_blocking_activity(self, minion_id):
+        """Return PostgreSQL blocked/blocker pairs using a fixed read-only SQL."""
+        logger.debug("salt_api: postgres_blocking_activity minion=%s", minion_id)
+        return await self.run_command(
+            minion_id,
+            build_postgres_blocking_command(),
+        )
+
+    async def postgres_health(self, minion_id):
+        """Prove PostgreSQL accepts SQL using a fixed read-only query."""
+        logger.debug("salt_api: postgres_health minion=%s", minion_id)
+        return await self.run_command(
+            minion_id,
+            build_postgres_health_command(),
+        )
+
+    async def postgres_connection_activity(self, minion_id):
+        """Return fixed read-only PostgreSQL connection-capacity evidence."""
+        logger.debug(
+            "salt_api: postgres_connection_activity minion=%s", minion_id
+        )
+        return await self.run_command(
+            minion_id,
+            build_postgres_connection_activity_command(),
+        )
 
 
 # Shared instance used by all tools. Initialized once at startup via

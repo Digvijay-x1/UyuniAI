@@ -39,3 +39,13 @@ async def get_service_logs(minion_id: str, service: str, lines: int = 50) -> str
     check the logs for errors.
     """
     return await salt_api.salt_client.service_logs(minion_id, service, lines)
+
+
+@tool
+async def get_service_details(minion_id: str, service: str) -> str:
+    """Get bounded systemd properties for a service on a minion.
+
+    Use this for a failed service to inspect its result, exit status, restart
+    count, unit file, and configured ExecStart command.
+    """
+    return await salt_api.salt_client.service_details(minion_id, service)

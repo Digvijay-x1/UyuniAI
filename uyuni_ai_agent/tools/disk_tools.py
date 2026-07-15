@@ -15,6 +15,10 @@
 from langchain_core.tools import tool
 
 from uyuni_ai_agent import salt_api
+from uyuni_ai_agent.disk_inspection import (
+    build_large_files_command,
+    build_service_references_command,
+)
 
 
 @tool
@@ -27,13 +31,39 @@ async def get_disk_usage(minion_id: str) -> str:
 
 
 @tool
-async def find_large_files(minion_id: str, path: str = "/", min_size: str = "100M") -> str:
-    """Find files larger than a specified size on a minion.
-    Use this to identify what is consuming disk space.
+async def find_large_files(
+    minion_id: str,
+    path: str = "/",
+    min_size: str = "10M",
+    limit: int = 20,
+) -> str:
+    """List the largest files on one filesystem under an absolute path.
+
+    Results include sizes and are sorted largest first. The search stays on the
+    selected filesystem, which makes it suitable for investigating a specific
+    full mountpoint.
+
     Args:
         minion_id: the Salt minion ID
         path: directory to search in (default: /)
-        min_size: minimum file size to report (default: 100M)
+        min_size: minimum file size to report (default: 10M)
+        limit: maximum results, bounded to 1-50
     """
-    cmd = f"find {path} -type f -size +{min_size} 2>/dev/null | head -20"
-    return await salt_api.salt_client.run_command(minion_id, cmd)
+    return await salt_api.salt_client.run_command(
+        minion_id,
+        build_large_files_command(path, min_size, limit),
+    )
+
+
+@tool
+async def find_service_references(minion_id: str, path: str) -> str:
+    """Find systemd unit files whose definitions reference an absolute path.
+
+    Use this after locating a full mount or runaway file to discover services
+    configured to read from or write to that location. The search is bounded to
+    systemd unit directories and does not modify the minion.
+    """
+    return await salt_api.salt_client.run_command(
+        minion_id,
+        build_service_references_command(path),
+    )

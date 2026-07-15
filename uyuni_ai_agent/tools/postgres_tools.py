@@ -19,13 +19,14 @@ from uyuni_ai_agent import salt_api
 
 @tool
 async def get_postgres_active_queries(minion_id: str) -> str:
-    """Get currently running PostgreSQL queries with duration and state.
+    """Get active PostgreSQL command metadata with duration and state.
 
-    Returns pid, state, query text, and how long each query has been running.
-    Useful for identifying long-running or stuck queries that consume connections.
+    Returns pid, state, query_id, command type, and duration. Full SQL text is
+    intentionally omitted because it may contain customer data or secrets.
     """
     sql = (
-        "SELECT pid, state, left(query, 100) AS query, "
+        "SELECT pid, state, query_id, "
+        "left(upper(split_part(ltrim(query), ' ', 1)), 32) AS command, "
         "age(clock_timestamp(), query_start) AS duration "
         "FROM pg_stat_activity "
         "WHERE state != 'idle' "
@@ -41,42 +42,32 @@ async def get_postgres_active_queries(minion_id: str) -> str:
 async def get_postgres_locks(minion_id: str) -> str:
     """Get PostgreSQL lock information to identify deadlocks and blocking.
 
-    Returns waiting locks and the queries holding them. Look for:
-    - 'granted: false' indicates a blocked query
-    - Multiple locks on the same relation suggest contention
+    Returns blocked/blocker PIDs, command types, query IDs, states, wait
+    events, and durations. Full SQL text is intentionally omitted.
     """
-    sql = (
-        "SELECT bl.pid AS blocked_pid, a.query AS blocked_query, "
-        "kl.pid AS blocking_pid, ka.query AS blocking_query "
-        "FROM pg_locks bl "
-        "JOIN pg_stat_activity a ON a.pid = bl.pid "
-        "JOIN pg_locks kl ON kl.transactionid = bl.transactionid AND kl.pid != bl.pid "
-        "JOIN pg_stat_activity ka ON ka.pid = kl.pid "
-        "WHERE NOT bl.granted"
-    )
-    return await salt_api.salt_client.run_command(
-        minion_id,
-        f'sudo -u postgres psql -c "{sql}"'
-    )
+    return await salt_api.salt_client.postgres_blocking_activity(minion_id)
+
+
+@tool
+async def get_postgres_health(minion_id: str) -> str:
+    """Prove PostgreSQL is available and accepting read-only SQL.
+
+    Returns server version, recovery state, and postmaster uptime. Use this
+    before diagnosing a lock wait so an available-but-blocked database is not
+    mistaken for a stopped PostgreSQL service.
+    """
+    return await salt_api.salt_client.postgres_health(minion_id)
 
 
 @tool
 async def get_postgres_connections(minion_id: str) -> str:
-    """Get PostgreSQL connection summary grouped by state and database.
+    """Get bounded PostgreSQL connection-capacity and ownership evidence.
 
-    Returns a breakdown of connections (active, idle, idle in transaction)
-    per database. Helps identify which database or app is consuming connections.
+    Returns max capacity, reserved slots, current utilization, remaining normal
+    slots, idle-transaction age, and counts grouped by database, user,
+    application and state. Full SQL text is intentionally omitted.
     """
-    sql = (
-        "SELECT datname, state, count(*) "
-        "FROM pg_stat_activity "
-        "GROUP BY datname, state "
-        "ORDER BY count DESC"
-    )
-    return await salt_api.salt_client.run_command(
-        minion_id,
-        f'sudo -u postgres psql -c "{sql}"'
-    )
+    return await salt_api.salt_client.postgres_connection_activity(minion_id)
 
 
 @tool
