@@ -42,7 +42,9 @@ def _rfc3339_now() -> str:
     )
 
 
-def build_alert_payload(analysis, *, severity, minion_id, metric_name):
+def build_alert_payload(
+    analysis, *, severity, minion_id, metric_name, service_name="", resource=""
+):
     """Build the AlertManager v2 payload from a RootCauseAnalysis.
 
     Structured fields become individual annotations so notification templates
@@ -61,16 +63,22 @@ def build_alert_payload(analysis, *, severity, minion_id, metric_name):
         f"{i}. {s}" for i, s in enumerate(analysis.remediation, 1)
     )
 
+    labels = {
+        "alertname": "AIAgentResponse",
+        "severity": severity,
+        "source": "ai-bot",
+        "minion": minion_id,
+        "metric": metric_name,
+        "component": analysis.affected_component,
+        "urgency": analysis.urgency.value,
+    }
+    if service_name:
+        labels["service"] = service_name
+    if resource:
+        labels["resource"] = resource
+
     return {
-        "labels": {
-            "alertname": "AIAgentResponse",
-            "severity": severity,
-            "source": "ai-bot",
-            "minion": minion_id,
-            "metric": metric_name,
-            "component": analysis.affected_component,
-            "urgency": analysis.urgency.value,
-        },
+        "labels": labels,
         "annotations": {
             "summary": analysis.summary,
             "root_cause": analysis.root_cause,
@@ -87,7 +95,8 @@ def build_alert_payload(analysis, *, severity, minion_id, metric_name):
 
 
 async def send_to_alertmanager(client, config, analysis, severity="info",
-                               minion_id="", metric_name=""):
+                               minion_id="", metric_name="", service_name="",
+                               resource=""):
     """Send an enriched, structured alert to AlertManager.
 
     Retries transient failures (connection errors and 5xx responses) with
@@ -104,7 +113,12 @@ async def send_to_alertmanager(client, config, analysis, severity="info",
     """
     url = f"{config['alertmanager']['url']}/api/v2/alerts"
     payload = [build_alert_payload(
-        analysis, severity=severity, minion_id=minion_id, metric_name=metric_name
+        analysis,
+        severity=severity,
+        minion_id=minion_id,
+        metric_name=metric_name,
+        service_name=service_name,
+        resource=resource,
     )]
 
     last_error = None

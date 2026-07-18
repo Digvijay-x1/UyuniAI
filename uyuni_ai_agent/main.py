@@ -21,9 +21,15 @@ import signal
 import httpx
 
 from uyuni_ai_agent.config import load_config
+from uyuni_ai_agent.deduplication import AnomalyDeduplicator
 from uyuni_ai_agent.logging_config import setup_logging
 from uyuni_ai_agent.prometheus_client import get_all_metrics
-from uyuni_ai_agent.anomaly_detector import check_all_metrics
+from uyuni_ai_agent.anomaly_detector import (
+    check_all_metrics,
+    check_failed_services,
+    check_postgres_blocked_transactions,
+    DependencyCorrelationWindow,
+)
 from uyuni_ai_agent.react_agent import investigate
 from uyuni_ai_agent.alert_manager import send_to_alertmanager
 from uyuni_ai_agent.salt_api import SaltAPIClient, set_salt_client
@@ -31,20 +37,19 @@ from uyuni_ai_agent.salt_api import SaltAPIClient, set_salt_client
 logger = logging.getLogger(__name__)
 
 
-async def process_minion(minion, http_client, config, dry_run, minion_sem, llm_sem):
-    """Process a single minion: ingest metrics, detect anomalies, investigate,
-    and alert.
+async def detect_minion(
+    minion,
+    http_client,
+    config,
+    minion_sem,
+    salt_client,
+):
+    """Ingest and detect one minion, returning a cycle snapshot.
 
-    Execution within a minion is sequential (no inner parallelism). Concurrency
-    across minions is bounded by ``minion_sem``; concurrent LLM investigations
-    are bounded by ``llm_sem``. Salt API calls are throttled separately inside
-    the SaltAPIClient so the Salt Master is not overwhelmed during alert storms.
+    Detection is intentionally separated from investigation so anomalies from
+    every minion can be correlated before any alert is emitted.
     """
     try:
-        # Read required keys inside the try so a malformed minion entry
-        # (missing "instance"/"id") raises a KeyError that is isolated to this
-        # minion instead of bubbling out of asyncio.gather() and aborting the
-        # whole polling cycle.
         instance = minion["instance"]
         minion_id = minion["id"]
         apache_instance = minion.get("apache_instance")
@@ -62,8 +67,17 @@ async def process_minion(minion, http_client, config, dry_run, minion_sem, llm_s
                     postgres_instance=postgres_instance,
                 )
                 logger.info(
-                    "Metrics: mem=%.1f%%, cpu=%.1f%%, disk=%.1f%%",
+                    (
+                        "Metrics: mem=%.1f%%, swap=%.1f%%, "
+                        "swap_activity=%.1f pages/s, cpu=%.1f%%, disk=%.1f%%"
+                    ),
                     metrics['memory_percent'],
+                    metrics.get("memory_pressure", {}).get(
+                        "swap_usage_percent", 0
+                    ),
+                    metrics.get("memory_pressure", {}).get(
+                        "swap_activity_pages_per_second", 0
+                    ),
                     metrics['cpu_percent'],
                     metrics['disk_percent'],
                 )
@@ -84,59 +98,137 @@ async def process_minion(minion, http_client, config, dry_run, minion_sem, llm_s
                 return
 
             # Step 2: DETECT
-            logger.debug("Step 2: checking thresholds...")
+            logger.debug("Step 2: checking metrics and systemd services...")
             try:
-                anomalies = await check_all_metrics(
+                metric_anomalies = await check_all_metrics(
                     instance, minion_id, http_client, config,
                     apache_instance=apache_instance,
                     postgres_instance=postgres_instance,
+                    metrics=metrics,
                 )
-                logger.debug("Found %d anomalies", len(anomalies))
+                service_anomalies = await check_failed_services(
+                    minion_id, salt_client, config
+                )
+                postgres_lock_anomalies = []
+                if postgres_instance:
+                    postgres_lock_anomalies = (
+                        await check_postgres_blocked_transactions(
+                            minion_id, salt_client, config
+                        )
+                    )
+                detected_anomalies = (
+                    metric_anomalies
+                    + service_anomalies
+                    + postgres_lock_anomalies
+                )
+                restarting_services = [
+                    anomaly.service_name
+                    for anomaly in service_anomalies
+                    if anomaly.service_name
+                ]
+                for anomaly in metric_anomalies:
+                    if anomaly.metric_name == "disk":
+                        anomaly.context["related_unhealthy_services"] = (
+                            restarting_services
+                        )
+                logger.debug(
+                    "Found %d metric, %d service, and %d PostgreSQL lock anomalies",
+                    len(metric_anomalies),
+                    len(service_anomalies),
+                    len(postgres_lock_anomalies),
+                )
             except Exception as e:
                 logger.error("Anomaly detection failed: %s", e, exc_info=True)
-                return
+                return None
 
-            if not anomalies:
-                logger.info("All metrics within normal range.")
-                return
-
-            for anomaly in anomalies:
-                logger.warning(
-                    "ANOMALY: %s [%s]", anomaly.description, anomaly.severity.value
-                )
-
-                # Step 3: INTELLIGENCE
-                logger.debug("Step 3: running ReAct agent...")
-                analysis = None
-                try:
-                    async with llm_sem:
-                        analysis = await investigate(anomaly, metrics, config)
-                    logger.info("Analysis:\n%s", analysis.to_text())
-                except Exception as e:
-                    logger.error("ReAct agent failed: %s", e, exc_info=True)
-
-                # Step 4: ACTION
-                if analysis is None:
-                    logger.error(
-                        "Skipping alert for %s: investigation produced no analysis.",
-                        anomaly.description,
-                    )
-                elif dry_run:
-                    logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
-                    logger.info("[DRY RUN] Analysis:\n%s", analysis.to_text())
-                else:
-                    logger.debug("Step 4: sending to AlertManager...")
-                    result = await send_to_alertmanager(
-                        http_client, config,
-                        analysis,
-                        severity=anomaly.severity.value,
-                        minion_id=anomaly.minion_id,
-                        metric_name=anomaly.metric_name,
-                    )
-                    logger.info("AlertManager: %s", result)
+            return {
+                "minion": minion,
+                "metrics": metrics,
+                "anomalies": detected_anomalies,
+            }
     except Exception as e:
         failed_id = minion.get("id", "<unknown>") if isinstance(minion, dict) else "<unknown>"
         logger.error("Minion %s processing failed: %s", failed_id, e, exc_info=True)
+        return None
+
+
+async def process_minion_anomalies(
+    snapshot,
+    all_cycle_anomalies,
+    http_client,
+    config,
+    dry_run,
+    llm_sem,
+    deduplicator,
+):
+    """Investigate and alert for one minion after global correlation."""
+    minion_id = snapshot["minion"]["id"]
+    metrics = snapshot["metrics"]
+    detected_anomalies = [
+        anomaly
+        for anomaly in all_cycle_anomalies
+        if anomaly.minion_id == minion_id
+    ]
+
+    try:
+        anomalies = deduplicator.filter(minion_id, detected_anomalies)
+        if not detected_anomalies:
+            logger.info(
+                "%s: all metrics, systemd services, and PostgreSQL locks "
+                "within normal range.",
+                minion_id,
+            )
+            return
+        if not anomalies:
+            logger.info(
+                "%s: detected anomalies are unchanged and inside the "
+                "deduplication cooldown.",
+                minion_id,
+            )
+            return
+
+        for anomaly in anomalies:
+            logger.warning(
+                "ANOMALY: %s [%s]", anomaly.description, anomaly.severity.value
+            )
+
+            logger.debug("Step 3: running ReAct agent...")
+            analysis = None
+            try:
+                async with llm_sem:
+                    analysis = await investigate(anomaly, metrics, config)
+                logger.info("Analysis:\n%s", analysis.to_text())
+            except Exception as e:
+                logger.error("ReAct agent failed: %s", e, exc_info=True)
+
+            if analysis is None:
+                logger.error(
+                    "Skipping alert for %s: investigation produced no analysis.",
+                    anomaly.description,
+                )
+            elif dry_run:
+                logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
+                logger.info("[DRY RUN] Analysis:\n%s", analysis.to_text())
+            else:
+                logger.debug("Step 4: sending to AlertManager...")
+                result = await send_to_alertmanager(
+                    http_client,
+                    config,
+                    analysis,
+                    severity=anomaly.severity.value,
+                    minion_id=anomaly.minion_id,
+                    metric_name=anomaly.metric_name,
+                    service_name=anomaly.service_name or "",
+                    resource=anomaly.resource or "",
+                )
+                logger.info("AlertManager: %s", result)
+    except Exception as e:
+        logger.error(
+            "Minion %s investigation failed: %s",
+            minion_id,
+            e,
+            exc_info=True,
+        )
 
 
 async def run(dry_run=False):
@@ -168,6 +260,13 @@ async def run(dry_run=False):
 
     minion_sem = asyncio.Semaphore(max_minions)
     llm_sem = asyncio.Semaphore(max_llm_calls)
+    deduplicator = AnomalyDeduplicator(
+        config.get("deduplication", {}).get("cooldown_seconds", 900)
+    )
+    correlation_cfg = config.get("dependency_correlation", {})
+    dependency_correlator = DependencyCorrelationWindow(
+        correlation_cfg.get("grace_seconds", 90)
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -184,9 +283,46 @@ async def run(dry_run=False):
     try:
         await salt.start()
         while not stop.is_set():
-            await asyncio.gather(*(
-                process_minion(minion, http_client, config, dry_run, minion_sem, llm_sem)
+            snapshots = await asyncio.gather(*(
+                detect_minion(
+                    minion,
+                    http_client,
+                    config,
+                    minion_sem,
+                    salt,
+                )
                 for minion in config["minions"]
+            ))
+            snapshots = [snapshot for snapshot in snapshots if snapshot]
+
+            cycle_anomalies = [
+                anomaly
+                for snapshot in snapshots
+                for anomaly in snapshot["anomalies"]
+            ]
+            cycle_anomalies = dependency_correlator.correlate(
+                cycle_anomalies,
+                correlation_cfg.get("postgres_apache", []),
+            )
+            if dependency_correlator.last_held_count:
+                logger.info(
+                    "Holding %d dependency-correlation candidate(s) for "
+                    "up to %.0fs to absorb scrape skew.",
+                    dependency_correlator.last_held_count,
+                    dependency_correlator.grace_seconds,
+                )
+
+            await asyncio.gather(*(
+                process_minion_anomalies(
+                    snapshot,
+                    cycle_anomalies,
+                    http_client,
+                    config,
+                    dry_run,
+                    llm_sem,
+                    deduplicator,
+                )
+                for snapshot in snapshots
             ))
 
             logger.info("Sleeping %ds...", interval)

@@ -11,15 +11,39 @@ salt_api:
   eauth: "file"
 
 minions:
-  - id: "ec2-54-87-17-226.compute-1.amazonaws.com"
-    instance: "client2.digvijayrawat.me:9100"
-    apache_instance: "client2.digvijayrawat.me:9117"
-    postgres_instance: "client2.digvijayrawat.me:9187"
+  - id: "client"
+    instance: "client.digvijayrawat.me:9100"
+    apache_instance: "client.digvijayrawat.me:9117"
+    postgres_instance: "client.digvijayrawat.me:9187"
+  - id: "client2"
+    instance: "168.144.177.121:9100"
+    apache_instance: "168.144.177.121:9117"
+    postgres_instance: "168.144.177.121:9187"
+
+# Cross-minion correlation is topology-gated to prevent unrelated alerts from
+# different machines being merged solely because they happened at the same
+# time. These edges can later be generated from Uyuni groups or service tags.
+dependency_correlation:
+  # Prometheus targets scrape independently. Hold a one-sided dependency
+  # candidate briefly so adjacent cycles can form one incident.
+  grace_seconds: 90
+  postgres_apache:
+    - postgres_minion: "client"
+      apache_minion: "client2"
 
 thresholds:
   memory:
     warning: 70
     critical: 95
+    pressure:
+      # Current page-in/page-out rates distinguish active swapping from stale
+      # swap occupancy. These apply only after memory exceeds warning.
+      swap_activity_pages_per_second:
+        warning: 1
+        critical: 100
+      swap_usage_percent:
+        warning: 5
+        critical: 25
   cpu:
     warning: 70
     critical: 95
@@ -40,6 +64,10 @@ thresholds:
     deadlocks_per_min:
       warning: 1
       critical: 5
+    # Ignore brief lock contention; investigate persistent blocked work.
+    blocked_transaction_seconds:
+      warning: 5
+      critical: 30
 
 llm:
   provider: "tokenrouter"  # "openai", "google_genai", or "huggingface"
@@ -51,6 +79,20 @@ logging:
 
 polling:
   interval_seconds: 60
+
+service_monitoring:
+  enabled: true
+  # Optional glob patterns for intentionally failed or masked test units.
+  ignored_units: []
+
+postgres_lock_monitoring:
+  # Enabled automatically for minions that define postgres_instance.
+  # The read-only query discovers every database in that PostgreSQL cluster.
+  enabled: true
+
+deduplication:
+  # Re-investigate a continuously failing unit only after this interval.
+  cooldown_seconds: 900
 
 concurrency:
   max_minions: 8       # minions processed in parallel per cycle

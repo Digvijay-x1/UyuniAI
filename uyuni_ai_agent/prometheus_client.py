@@ -72,6 +72,100 @@ async def get_memory_usage_percent(instance, client, prometheus_url):
     return 0.0
 
 
+async def _get_first_sample_value(query, client, prometheus_url):
+    """Return the first finite-looking Prometheus sample or zero."""
+    result = await query_prometheus(query, client, prometheus_url)
+    if isinstance(result, list) and result:
+        try:
+            value = float(result[0]["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return 0.0
+        if value >= 0:
+            return value
+    return 0.0
+
+
+async def get_memory_pressure_metrics(instance, client, prometheus_url):
+    """Return memory, swap activity, and secondary CPU-pressure signals.
+
+    Swap usage alone is not proof of current thrashing because inactive pages
+    can remain swapped out after an incident. The pswpin/pswpout rates provide
+    the current activity needed for that distinction.
+    """
+    selector = f'instance="{instance}"'
+    available = await _get_first_sample_value(
+        f'node_memory_MemAvailable_bytes{{{selector}}}',
+        client,
+        prometheus_url,
+    )
+    total = await _get_first_sample_value(
+        f'node_memory_MemTotal_bytes{{{selector}}}',
+        client,
+        prometheus_url,
+    )
+    swap_total = await _get_first_sample_value(
+        f'node_memory_SwapTotal_bytes{{{selector}}}',
+        client,
+        prometheus_url,
+    )
+    swap_free = await _get_first_sample_value(
+        f'node_memory_SwapFree_bytes{{{selector}}}',
+        client,
+        prometheus_url,
+    )
+    swap_in = await _get_first_sample_value(
+        f'rate(node_vmstat_pswpin{{{selector}}}[2m])',
+        client,
+        prometheus_url,
+    )
+    swap_out = await _get_first_sample_value(
+        f'rate(node_vmstat_pswpout{{{selector}}}[2m])',
+        client,
+        prometheus_url,
+    )
+    system_cpu = await _get_first_sample_value(
+        (
+            f'avg(irate(node_cpu_seconds_total{{{selector},'
+            'mode="system"}[2m])) * 100'
+        ),
+        client,
+        prometheus_url,
+    )
+    iowait_cpu = await _get_first_sample_value(
+        (
+            f'avg(irate(node_cpu_seconds_total{{{selector},'
+            'mode="iowait"}[2m])) * 100'
+        ),
+        client,
+        prometheus_url,
+    )
+
+    memory_usage = (
+        max(0.0, min(100.0, 100.0 - (available / total * 100.0)))
+        if total > 0
+        else 0.0
+    )
+    swap_used = max(0.0, swap_total - min(swap_free, swap_total))
+    swap_usage = (
+        max(0.0, min(100.0, swap_used / swap_total * 100.0))
+        if swap_total > 0
+        else 0.0
+    )
+    return {
+        "memory_usage_percent": memory_usage,
+        "memory_available_bytes": available,
+        "memory_total_bytes": total,
+        "swap_total_bytes": swap_total,
+        "swap_used_bytes": swap_used,
+        "swap_usage_percent": swap_usage,
+        "swap_in_pages_per_second": swap_in,
+        "swap_out_pages_per_second": swap_out,
+        "swap_activity_pages_per_second": swap_in + swap_out,
+        "system_cpu_percent": system_cpu,
+        "iowait_cpu_percent": iowait_cpu,
+    }
+
+
 async def get_cpu_usage_percent(instance, client, prometheus_url):
     """Get current CPU usage percentage for an instance."""
     query = (
@@ -96,6 +190,50 @@ async def get_disk_usage_percent(instance, client, prometheus_url, mountpoint="/
     if isinstance(result, list) and result:
         return float(result[0]['value'][1])
     return 0.0
+
+
+async def get_filesystem_usage_percent(instance, client, prometheus_url):
+    """Return usage for every writable, persistent filesystem on an instance.
+
+    Filesystems are discovered from node_exporter labels, so adding or removing
+    a mount does not require an agent configuration change.
+    """
+    excluded_fstypes = (
+        "autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|"
+        "fusectl|hugetlbfs|mqueue|overlay|proc|pstore|ramfs|securityfs|"
+        "squashfs|sysfs|tracefs|tmpfs"
+    )
+    selector = (
+        f'instance="{instance}",'
+        f'fstype!~"{excluded_fstypes}"'
+    )
+    query = (
+        f'(100 - (node_filesystem_avail_bytes{{{selector}}} '
+        f'/ node_filesystem_size_bytes{{{selector}}} * 100)) '
+        f'and on(instance,device,mountpoint) '
+        f'(node_filesystem_readonly{{instance="{instance}"}} == 0)'
+    )
+    result = await query_prometheus(query, client, prometheus_url)
+    if not isinstance(result, list):
+        return []
+
+    filesystems = []
+    for sample in result:
+        metric = sample.get("metric", {})
+        try:
+            usage = float(sample["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        mountpoint = metric.get("mountpoint")
+        if not mountpoint or usage < 0 or usage > 100:
+            continue
+        filesystems.append({
+            "mountpoint": mountpoint,
+            "device": metric.get("device", "unknown"),
+            "fstype": metric.get("fstype", "unknown"),
+            "usage_percent": usage,
+        })
+    return sorted(filesystems, key=lambda item: item["mountpoint"])
 
 
 # ── Apache Exporter Metrics ──
@@ -194,10 +332,26 @@ async def get_all_metrics(instance, client, config, apache_instance=None, postgr
     Metrics are fetched sequentially (no inner parallelism).
     """
     prometheus_url = config["prometheus"]["url"]
+    filesystems = await get_filesystem_usage_percent(
+        instance, client, prometheus_url
+    )
+    root_usage = next(
+        (
+            fs["usage_percent"]
+            for fs in filesystems
+            if fs["mountpoint"] == "/"
+        ),
+        0.0,
+    )
+    memory_pressure = await get_memory_pressure_metrics(
+        instance, client, prometheus_url
+    )
     metrics = {
-        "memory_percent": await get_memory_usage_percent(instance, client, prometheus_url),
+        "memory_percent": memory_pressure["memory_usage_percent"],
+        "memory_pressure": memory_pressure,
         "cpu_percent": await get_cpu_usage_percent(instance, client, prometheus_url),
-        "disk_percent": await get_disk_usage_percent(instance, client, prometheus_url),
+        "disk_percent": root_usage,
+        "filesystems": filesystems,
     }
 
     if apache_instance:
