@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import logging
 
@@ -20,16 +21,35 @@ from langchain_core.messages import SystemMessage
 
 from uyuni_ai_agent.llm_provider import get_llm
 from uyuni_ai_agent.models import RootCauseAnalysis
-from uyuni_ai_agent.tools.process_tools import get_top_memory_processes, get_top_cpu_processes
-from uyuni_ai_agent.tools.disk_tools import get_disk_usage, find_large_files
-from uyuni_ai_agent.tools.service_tools import get_service_status, get_service_logs
+from uyuni_ai_agent import salt_api
+from uyuni_ai_agent.disk_inspection import parse_service_unit_references
+from uyuni_ai_agent.tools.process_tools import (
+    get_cpu_pressure_snapshot,
+    get_memory_pressure_snapshot,
+    get_top_cpu_processes,
+    get_top_memory_processes,
+)
+from uyuni_ai_agent.tools.disk_tools import (
+    find_large_files,
+    find_service_references,
+    get_disk_usage,
+)
+from uyuni_ai_agent.tools.service_tools import (
+    get_service_details,
+    get_service_logs,
+    get_service_status,
+)
 from uyuni_ai_agent.tools.network_tools import check_connectivity, get_listening_ports
 from uyuni_ai_agent.tools.apache_tools import (
-    get_apache_status, get_apache_error_log, get_apache_access_log, get_apache_config_check,
+    get_apache_overload_snapshot,
+    get_apache_status,
+    get_apache_error_log,
+    get_apache_access_log,
+    get_apache_config_check,
 )
 from uyuni_ai_agent.tools.postgres_tools import (
     get_postgres_active_queries, get_postgres_locks,
-    get_postgres_connections, get_postgres_log,
+    get_postgres_connections, get_postgres_health, get_postgres_log,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,13 +60,18 @@ ALL_TOOLS = [
     # System tools
     get_top_memory_processes,
     get_top_cpu_processes,
+    get_memory_pressure_snapshot,
+    get_cpu_pressure_snapshot,
     get_disk_usage,
     find_large_files,
+    find_service_references,
     get_service_status,
+    get_service_details,
     get_service_logs,
     check_connectivity,
     get_listening_ports,
     # Apache tools
+    get_apache_overload_snapshot,
     get_apache_status,
     get_apache_error_log,
     get_apache_access_log,
@@ -54,6 +79,7 @@ ALL_TOOLS = [
     # PostgreSQL tools
     get_postgres_active_queries,
     get_postgres_locks,
+    get_postgres_health,
     get_postgres_connections,
     get_postgres_log,
 ]
@@ -125,14 +151,96 @@ def get_prompt_for_anomaly(anomaly, metrics):
     """Pick the right prompt template based on the anomaly type."""
     template_map = {
         "memory": "high_ram.md",
+        "memory_pressure": "high_ram.md",
         "cpu": "high_cpu.md",
         "disk": "disk_full.md",
         "apache_busy_workers": "apache_overload.md",
         "apache_requests": "apache_overload.md",
-        "postgres_connections": "postgres_issues.md",
+        "postgres_connections": "postgres_connection_exhaustion.md",
         "postgres_deadlocks": "postgres_issues.md",
+        "postgres_blocked_transaction": "postgres_blocked_transaction.md",
+        "postgres_apache_chain": "postgres_apache_chain.md",
+        "service_down": "service_down.md",
     }
     template_name = template_map.get(anomaly.metric_name, "high_ram.md")
+    if anomaly.metric_name in {"memory", "memory_pressure"}:
+        return load_prompt(
+            template_name,
+            minion_id=anomaly.minion_id,
+            instance=anomaly.minion_id,
+            current_value=f"{anomaly.current_value:.1f}",
+            threshold=f"{anomaly.threshold:.1f}",
+            severity=anomaly.severity.value,
+            memory_available_bytes=f"{anomaly.context.get('memory_available_bytes', 0):.0f}",
+            memory_total_bytes=f"{anomaly.context.get('memory_total_bytes', 0):.0f}",
+            swap_used_bytes=f"{anomaly.context.get('swap_used_bytes', 0):.0f}",
+            swap_total_bytes=f"{anomaly.context.get('swap_total_bytes', 0):.0f}",
+            swap_usage_percent=f"{anomaly.context.get('swap_usage_percent', 0):.1f}",
+            swap_in_pages_per_second=f"{anomaly.context.get('swap_in_pages_per_second', 0):.1f}",
+            swap_out_pages_per_second=f"{anomaly.context.get('swap_out_pages_per_second', 0):.1f}",
+            system_cpu_percent=f"{anomaly.context.get('system_cpu_percent', 0):.1f}",
+            iowait_cpu_percent=f"{anomaly.context.get('iowait_cpu_percent', 0):.1f}",
+            cpu_usage_percent=f"{anomaly.context.get('cpu_usage_percent', metrics.get('cpu_percent', 0)):.1f}",
+            metrics=str(metrics),
+        )
+    if anomaly.metric_name == "service_down":
+        return load_prompt(
+            template_name,
+            minion_id=anomaly.minion_id,
+            instance=anomaly.minion_id,
+            service_name=anomaly.service_name or "unknown.service",
+            severity=anomaly.severity.value,
+            metrics=str(metrics),
+        )
+    if anomaly.metric_name == "disk":
+        return load_prompt(
+            template_name,
+            minion_id=anomaly.minion_id,
+            instance=anomaly.minion_id,
+            mountpoint=anomaly.context.get("mountpoint", anomaly.resource or "/"),
+            device=anomaly.context.get("device", "unknown"),
+            related_services=", ".join(
+                anomaly.context.get("related_unhealthy_services", [])
+            ) or "none discovered",
+            current_value=f"{anomaly.current_value:.1f}",
+            threshold=f"{anomaly.threshold:.1f}",
+            severity=anomaly.severity.value,
+            metrics=str(metrics),
+        )
+    if anomaly.metric_name == "postgres_blocked_transaction":
+        return load_prompt(
+            template_name,
+            minion_id=anomaly.minion_id,
+            instance=anomaly.minion_id,
+            database=anomaly.context.get("database", "unknown"),
+            blocked_pids=", ".join(
+                str(pid) for pid in anomaly.context.get("blocked_pids", [])
+            ) or "unknown",
+            blocker_pids=", ".join(
+                str(pid) for pid in anomaly.context.get("blocker_pids", [])
+            ) or "unknown",
+            current_value=f"{anomaly.current_value:.1f}",
+            threshold=f"{anomaly.threshold:.1f}",
+            severity=anomaly.severity.value,
+            metrics=str(metrics),
+        )
+    if anomaly.metric_name == "postgres_apache_chain":
+        return load_prompt(
+            template_name,
+            minion_id=anomaly.minion_id,
+            instance=anomaly.minion_id,
+            apache_minion_id=anomaly.context.get(
+                "apache_minion_id", anomaly.minion_id
+            ),
+            postgres_minion_id=anomaly.context.get(
+                "postgres_minion_id", anomaly.minion_id
+            ),
+            metric_name=anomaly.metric_name,
+            current_value=f"{anomaly.current_value:.1f}",
+            threshold=f"{anomaly.threshold:.1f}",
+            severity=anomaly.severity.value,
+            metrics=str(metrics),
+        )
     return load_prompt(
         template_name,
         minion_id=anomaly.minion_id,
@@ -142,6 +250,192 @@ def get_prompt_for_anomaly(anomaly, metrics):
         threshold=f"{anomaly.threshold:.1f}",
         severity=anomaly.severity.value,
         metrics=str(metrics),
+    )
+
+
+def _bounded_text(value, limit=8000):
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+async def collect_required_disk_evidence(anomaly):
+    """Collect the minimum evidence required for a causal disk RCA.
+
+    This path is deterministic: the LLM may call additional tools, but cannot
+    skip filesystem, largest-file, and candidate-service inspection.
+    """
+    client = salt_api.salt_client
+    if client is None:
+        return "Salt client is unavailable; required disk evidence not collected."
+
+    minion_id = anomaly.minion_id
+    mountpoint = anomaly.context.get("mountpoint", anomaly.resource or "/")
+    disk_usage, largest_files, references = await asyncio.gather(
+        client.disk_usage(minion_id),
+        client.largest_files(minion_id, mountpoint),
+        client.service_references(minion_id, mountpoint),
+    )
+
+    candidates = list(
+        anomaly.context.get("related_unhealthy_services", [])
+    )
+    for unit in parse_service_unit_references(references):
+        if unit not in candidates:
+            candidates.append(unit)
+    candidates = candidates[:3]
+
+    service_evidence = []
+    if candidates:
+        inspections = await asyncio.gather(*(
+            asyncio.gather(
+                client.service_details(minion_id, service),
+                client.service_logs(minion_id, service, lines=30),
+            )
+            for service in candidates
+        ))
+        for service, (details, logs) in zip(candidates, inspections):
+            service_evidence.append(
+                f"SERVICE {service}\n"
+                f"DETAILS:\n{_bounded_text(details, 8000)}\n"
+                f"JOURNAL:\n{_bounded_text(logs, 8000)}"
+            )
+    else:
+        service_evidence.append("No candidate systemd service was discovered.")
+
+    return (
+        f"AFFECTED MOUNTPOINT: {mountpoint}\n"
+        f"DISK USAGE:\n{_bounded_text(disk_usage, 10000)}\n\n"
+        f"LARGEST FILES:\n{_bounded_text(largest_files, 8000)}\n\n"
+        f"UNIT FILE REFERENCES:\n{_bounded_text(references, 4000)}\n\n"
+        + "\n\n".join(service_evidence)
+    )
+
+
+async def collect_required_postgres_lock_evidence(anomaly):
+    """Collect availability and lock-chain evidence before LLM reasoning."""
+    client = salt_api.salt_client
+    if client is None:
+        return (
+            "Salt client is unavailable; required PostgreSQL evidence "
+            "was not collected."
+        )
+
+    health, lock_pairs, apache_snapshot = await asyncio.gather(
+        client.postgres_health(anomaly.minion_id),
+        client.postgres_blocking_activity(anomaly.minion_id),
+        client.apache_overload_snapshot(anomaly.minion_id),
+    )
+    detector_pairs = anomaly.context.get("blocked_pairs", [])
+    return (
+        "POSTGRESQL AVAILABILITY:\n"
+        f"{_bounded_text(health, 4000)}\n\n"
+        "CURRENT BLOCKED/BLOCKER PAIRS:\n"
+        f"{_bounded_text(lock_pairs, 12000)}\n\n"
+        "CURRENT APACHE/DEPENDENCY SNAPSHOT:\n"
+        f"{_bounded_text(apache_snapshot, 18000)}\n\n"
+        "DETECTOR SNAPSHOT:\n"
+        f"{_bounded_text(detector_pairs, 12000)}"
+    )
+
+
+async def collect_required_apache_evidence(anomaly):
+    """Collect one coherent traffic/backend snapshot before Apache RCA."""
+    client = salt_api.salt_client
+    if client is None:
+        return (
+            "Salt client is unavailable; required Apache evidence was not "
+            "collected."
+        )
+    apache_minion_id = anomaly.context.get(
+        "apache_minion_id", anomaly.minion_id
+    )
+    postgres_minion_id = anomaly.context.get(
+        "postgres_minion_id", anomaly.minion_id
+    )
+    snapshot, postgres_health, postgres_locks, postgres_connections = (
+        await asyncio.gather(
+            client.apache_overload_snapshot(apache_minion_id),
+            client.postgres_health(postgres_minion_id),
+            client.postgres_blocking_activity(postgres_minion_id),
+            client.postgres_connection_activity(postgres_minion_id),
+        )
+    )
+    return (
+        "PROMETHEUS DETECTOR SNAPSHOT:\n"
+        f"{_bounded_text(anomaly.context, 5000)}\n\n"
+        f"APACHE/APPLICATION MINION: {apache_minion_id}\n"
+        "LIVE APACHE, TRAFFIC, CONNECTION, PROCESS, AND CONFIG SNAPSHOT:\n"
+        f"{_bounded_text(snapshot, 24000)}\n\n"
+        f"POSTGRESQL MINION: {postgres_minion_id}\n"
+        "POSTGRESQL AVAILABILITY:\n"
+        f"{_bounded_text(postgres_health, 4000)}\n\n"
+        "POSTGRESQL BLOCKED/BLOCKER PAIRS:\n"
+        f"{_bounded_text(postgres_locks, 14000)}\n\n"
+        "POSTGRESQL CONNECTION CAPACITY/OWNERSHIP:\n"
+        f"{_bounded_text(postgres_connections, 12000)}"
+    )
+
+
+async def collect_required_postgres_connection_evidence(anomaly):
+    """Collect availability, capacity ownership, and lock evidence."""
+    client = salt_api.salt_client
+    if client is None:
+        return (
+            "Salt client is unavailable; required PostgreSQL connection "
+            "evidence was not collected."
+        )
+
+    health, connections, lock_pairs = await asyncio.gather(
+        client.postgres_health(anomaly.minion_id),
+        client.postgres_connection_activity(anomaly.minion_id),
+        client.postgres_blocking_activity(anomaly.minion_id),
+    )
+    return (
+        "POSTGRESQL AVAILABILITY:\n"
+        f"{_bounded_text(health, 4000)}\n\n"
+        "CONNECTION CAPACITY AND OWNERSHIP:\n"
+        f"{_bounded_text(connections, 16000)}\n\n"
+        "CURRENT BLOCKED/BLOCKER PAIRS:\n"
+        f"{_bounded_text(lock_pairs, 10000)}\n\n"
+        "PROMETHEUS DETECTOR SNAPSHOT:\n"
+        f"{_bounded_text(anomaly.context, 4000)}"
+    )
+
+
+async def collect_required_memory_evidence(anomaly):
+    """Collect a live, fixed-command snapshot before memory RCA reasoning."""
+    client = salt_api.salt_client
+    if client is None:
+        return (
+            "Salt client is unavailable; required memory-pressure evidence "
+            "was not collected."
+        )
+
+    snapshot = await client.memory_pressure_snapshot(anomaly.minion_id)
+    return (
+        "PROMETHEUS DETECTOR SNAPSHOT:\n"
+        f"{_bounded_text(anomaly.context, 8000)}\n\n"
+        "LIVE HOST SNAPSHOT:\n"
+        f"{_bounded_text(snapshot, 16000)}"
+    )
+
+
+async def collect_required_cpu_evidence(anomaly):
+    """Collect a live fixed-command snapshot before CPU RCA reasoning."""
+    client = salt_api.salt_client
+    if client is None:
+        return (
+            "Salt client is unavailable; required CPU evidence was not "
+            "collected."
+        )
+    snapshot = await client.cpu_pressure_snapshot(anomaly.minion_id)
+    return (
+        "PROMETHEUS DETECTOR SNAPSHOT:\n"
+        f"{_bounded_text(anomaly.context, 8000)}\n\n"
+        "LIVE HOST SNAPSHOT:\n"
+        f"{_bounded_text(snapshot, 16000)}"
     )
 
 
@@ -172,6 +466,57 @@ async def investigate(anomaly, metrics, config):
 
     # Load scenario-specific prompt
     scenario_prompt = get_prompt_for_anomaly(anomaly, metrics)
+    required_evidence = ""
+    if anomaly.metric_name in {"memory", "memory_pressure"}:
+        required_evidence = await collect_required_memory_evidence(anomaly)
+        scenario_prompt += (
+            "\n\n## Pre-collected mandatory evidence\n\n"
+            f"{required_evidence}\n\n"
+            "Use this evidence in the RCA. You may call tools for clarification."
+        )
+    elif anomaly.metric_name == "cpu":
+        required_evidence = await collect_required_cpu_evidence(anomaly)
+        scenario_prompt += (
+            "\n\n## Pre-collected mandatory evidence\n\n"
+            f"{required_evidence}\n\n"
+            "Use this evidence in the RCA. You may call tools for clarification."
+        )
+    elif anomaly.metric_name in {
+        "apache_busy_workers",
+        "apache_requests",
+        "postgres_apache_chain",
+    }:
+        required_evidence = await collect_required_apache_evidence(anomaly)
+        scenario_prompt += (
+            "\n\n## Pre-collected mandatory evidence\n\n"
+            f"{required_evidence}\n\n"
+            "Use this evidence in the RCA. You may call tools for clarification."
+        )
+    elif anomaly.metric_name == "disk":
+        required_evidence = await collect_required_disk_evidence(anomaly)
+        scenario_prompt += (
+            "\n\n## Pre-collected mandatory evidence\n\n"
+            f"{required_evidence}\n\n"
+            "Use this evidence in the RCA. You may call tools for clarification."
+        )
+    elif anomaly.metric_name == "postgres_blocked_transaction":
+        required_evidence = await collect_required_postgres_lock_evidence(
+            anomaly
+        )
+        scenario_prompt += (
+            "\n\n## Pre-collected mandatory evidence\n\n"
+            f"{required_evidence}\n\n"
+            "Use this evidence in the RCA. You may call tools for clarification."
+        )
+    elif anomaly.metric_name == "postgres_connections":
+        required_evidence = await collect_required_postgres_connection_evidence(
+            anomaly
+        )
+        scenario_prompt += (
+            "\n\n## Pre-collected mandatory evidence\n\n"
+            f"{required_evidence}\n\n"
+            "Use this evidence in the RCA. You may call tools for clarification."
+        )
 
     # Phase 1: run the ReAct agent (async; async tools are awaited by the tool node)
     result = await agent.ainvoke({
@@ -182,6 +527,12 @@ async def investigate(anomaly, metrics, config):
     })
 
     reasoning = _extract_text(result["messages"][-1])
+    if required_evidence:
+        reasoning = (
+            "PRE-COLLECTED MANDATORY EVIDENCE:\n"
+            f"{required_evidence}\n\n"
+            f"AGENT SYNTHESIS:\n{reasoning}"
+        )
 
     # Phase 2: structure the free-form reasoning into RootCauseAnalysis.
     structured_llm = get_structured_llm(config)
@@ -194,7 +545,10 @@ async def investigate(anomaly, metrics, config):
         f"ANOMALY: {anomaly.description} "
         f"(metric={anomaly.metric_name}, value={anomaly.current_value:.1f}, "
         f"threshold={anomaly.threshold:.1f}, severity={anomaly.severity.value}, "
-        f"minion={anomaly.minion_id})\n\n"
+        f"minion={anomaly.minion_id}, "
+        f"service={anomaly.service_name or 'n/a'}, "
+        f"resource={anomaly.resource or 'n/a'}, "
+        f"context={anomaly.context})\n\n"
         f"INVESTIGATION:\n{reasoning}"
     )
     analysis = await structured_llm.ainvoke([
