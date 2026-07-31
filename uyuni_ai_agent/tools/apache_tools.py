@@ -15,6 +15,7 @@
 from langchain_core.tools import tool
 
 from uyuni_ai_agent import salt_api
+from uyuni_ai_agent.validation import bounded_int
 
 
 @tool
@@ -51,6 +52,7 @@ async def get_apache_error_log(minion_id: str, lines: int = 50) -> str:
     Returns the last N lines from /var/log/apache2/error.log.
     Look for [error] and [crit] entries, module errors, and segfaults.
     """
+    lines = bounded_int(lines, name="lines", minimum=1, maximum=200)
     return await salt_api.salt_client.run_command(
         minion_id,
         f"tail -n {lines} /var/log/apache2/error.log"
@@ -64,6 +66,7 @@ async def get_apache_access_log(minion_id: str, lines: int = 50) -> str:
     Returns the last N lines from /var/log/apache2/access.log.
     Useful for identifying traffic spikes, suspicious IPs, or slow requests.
     """
+    lines = bounded_int(lines, name="lines", minimum=1, maximum=200)
     return await salt_api.salt_client.run_command(
         minion_id,
         f"tail -n {lines} /var/log/apache2/access.log"

@@ -15,6 +15,7 @@
 from langchain_core.tools import tool
 
 from uyuni_ai_agent import salt_api
+from uyuni_ai_agent.validation import build_ping_command
 
 
 @tool
@@ -22,7 +23,7 @@ async def check_connectivity(minion_id: str, target: str) -> str:
     """Ping a target host from a minion to check network connectivity.
     Use this when you suspect network issues are causing service problems.
     """
-    cmd = f"ping -c 3 {target}"
+    cmd = build_ping_command(target)
     return await salt_api.salt_client.run_command(minion_id, cmd)
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 
 import httpx
 
@@ -32,8 +33,28 @@ from uyuni_ai_agent.postgres_inspection import (
 from uyuni_ai_agent.memory_inspection import build_memory_pressure_command
 from uyuni_ai_agent.cpu_inspection import build_cpu_pressure_command
 from uyuni_ai_agent.systemd import validate_systemd_service
+from uyuni_ai_agent.validation import bounded_int, validate_configured_minion
 
 logger = logging.getLogger(__name__)
+
+
+class SaltAPIError(RuntimeError):
+    """Raised when Salt returns a malformed or incomplete API response."""
+
+
+def extract_minion_result(payload, minion_id):
+    """Extract one exact minion result from a Salt lowstate response."""
+    if not isinstance(payload, Mapping):
+        raise SaltAPIError("Salt API response must be a JSON object")
+    returns = payload.get("return")
+    if not isinstance(returns, list) or not returns:
+        raise SaltAPIError("Salt API response has no return data")
+    result = returns[0]
+    if not isinstance(result, Mapping):
+        raise SaltAPIError("Salt API return data must be an object")
+    if minion_id not in result:
+        raise SaltAPIError(f"Salt API returned no data for minion {minion_id!r}")
+    return result[minion_id]
 
 
 class SaltAPIClient:
@@ -58,6 +79,9 @@ class SaltAPIClient:
         self.username = api_cfg["username"]
         self.password = api_cfg.get("password", "")
         self.eauth = api_cfg.get("eauth", "file")
+        self.allowed_minions = frozenset(
+            minion["id"] for minion in config["minions"]
+        )
         # Global cap on concurrent Salt API calls (protects the Salt Master).
         self.salt_semaphore = asyncio.Semaphore(
             concurrency_cfg.get("max_salt_calls", 10)
@@ -83,6 +107,8 @@ class SaltAPIClient:
 
     async def login(self):
         """Authenticate via /login. Session cookies are stored automatically."""
+        if self._client is None:
+            raise SaltAPIError("Salt API client has not been started")
         logger.debug("salt_api: logging in to %s", self.url)
         resp = await self._client.post(
             f"{self.url}/login",
@@ -117,7 +143,10 @@ class SaltAPIClient:
         Re-authenticates once on 401. Bounded by salt_semaphore to protect the
         Salt Master under concurrent alert storms.
         """
+        tgt = validate_configured_minion(tgt, self.allowed_minions)
         await self._ensure_login()
+        if self._client is None:
+            raise SaltAPIError("Salt API client has not been started")
 
         lowstate = {
             "client": "local",
@@ -147,34 +176,40 @@ class SaltAPIClient:
 
             resp.raise_for_status()
 
-        data = resp.json()
-        result = data.get("return", [{}])[0]
-        return result.get(tgt, "No response from minion")
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise SaltAPIError("Salt API returned invalid JSON") from exc
+        return extract_minion_result(data, tgt)
+
+    async def _safe_call(self, minion_id, fun, arg=None):
+        """Run one Salt function and convert expected I/O failures to evidence."""
+        try:
+            return await self._call(minion_id, fun, arg)
+        except (httpx.HTTPError, SaltAPIError, ValueError) as exc:
+            logger.warning(
+                "Salt API call failed: minion=%s function=%s error=%s",
+                minion_id,
+                fun,
+                exc,
+            )
+            return f"Salt API call failed: {exc}"
 
     async def run_command(self, minion_id, cmd):
         """Run a shell command on a minion via cmd.run."""
         logger.debug("salt_api: cmd.run minion=%s cmd=%s", minion_id, cmd[:60])
-        try:
-            return await self._call(minion_id, "cmd.run", [cmd])
-        except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+        return await self._safe_call(minion_id, "cmd.run", [cmd])
 
     async def disk_usage(self, minion_id):
         """Get disk usage for a minion via disk.usage."""
         logger.debug("salt_api: disk.usage minion=%s", minion_id)
-        try:
-            return str(await self._call(minion_id, "disk.usage"))
-        except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+        return str(await self._safe_call(minion_id, "disk.usage"))
 
     async def service_status(self, minion_id, service):
         """Check if a service is running on a minion."""
         service = validate_systemd_service(service)
         logger.debug("salt_api: service.status minion=%s service=%s", minion_id, service)
-        try:
-            return await self._call(minion_id, "service.status", [service])
-        except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+        return await self._safe_call(minion_id, "service.status", [service])
 
     async def largest_files(
         self, minion_id, path, min_size="10M", limit=20
@@ -195,13 +230,10 @@ class SaltAPIClient:
     async def service_logs(self, minion_id, service, lines=50):
         """Get recent journal logs for a service."""
         service = validate_systemd_service(service)
-        lines = max(1, min(int(lines), 200))
+        lines = bounded_int(lines, name="lines", minimum=1, maximum=200)
         logger.debug("salt_api: service_logs minion=%s service=%s", minion_id, service)
         cmd = f"journalctl -u {service} -n {lines} --no-pager"
-        try:
-            return await self._call(minion_id, "cmd.run", [cmd])
-        except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+        return await self._safe_call(minion_id, "cmd.run", [cmd])
 
     async def failed_systemd_services(self, minion_id):
         """Return failed or auto-restarting services with a fixed command.
@@ -215,10 +247,7 @@ class SaltAPIClient:
             "--no-legend --no-pager --plain"
         )
         logger.debug("salt_api: failed_systemd_services minion=%s", minion_id)
-        try:
-            return await self._call(minion_id, "cmd.run", [cmd])
-        except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+        return await self._safe_call(minion_id, "cmd.run", [cmd])
 
     async def service_details(self, minion_id, service):
         """Return bounded diagnostic properties for one systemd service."""
@@ -232,10 +261,7 @@ class SaltAPIClient:
             f"--property={properties}"
         )
         logger.debug("salt_api: service_details minion=%s service=%s", minion_id, service)
-        try:
-            return await self._call(minion_id, "cmd.run", [cmd])
-        except Exception as e:
-            return f"Salt API call failed: {str(e)}"
+        return await self._safe_call(minion_id, "cmd.run", [cmd])
 
     async def memory_pressure_snapshot(self, minion_id):
         """Return bounded live memory, swap, CPU, and top-RSS evidence."""

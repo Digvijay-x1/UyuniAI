@@ -15,6 +15,7 @@
 from langchain_core.tools import tool
 
 from uyuni_ai_agent import salt_api
+from uyuni_ai_agent.validation import bounded_int
 
 
 @tool
@@ -77,6 +78,7 @@ async def get_postgres_log(minion_id: str, lines: int = 50) -> str:
     Returns the last N lines from the PostgreSQL log file.
     Look for ERROR, FATAL, PANIC entries, and deadlock detection messages.
     """
+    lines = bounded_int(lines, name="lines", minimum=1, maximum=200)
     return await salt_api.salt_client.run_command(
         minion_id,
         f"tail -n {lines} /var/log/postgresql/postgresql-*-main.log 2>/dev/null || "
