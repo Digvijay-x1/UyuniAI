@@ -10,13 +10,48 @@ This project is part of an ongoing effort to bring intelligent, automated monito
 
 The agent runs as a sidecar Podman container alongside the Uyuni server. Every 60 seconds it:
 
-1. **Pulls metrics** from Prometheus (CPU, memory, disk usage via PromQL).
-2. **Checks thresholds** -- if something crosses warning/critical levels, it flags it as an anomaly.
-3. **Investigates** -- a LangGraph ReAct agent takes over, calling Salt commands on the affected minion (e.g., listing top processes, checking service status) and reasoning about what it finds using an LLM.
+1. **Pulls metrics** from Prometheus (CPU, available memory, swap occupancy
+   and page activity, and every writable persistent filesystem via PromQL).
+2. **Discovers anomalies** -- it checks metric thresholds and asks systemd for
+   every failed or automatically restarting service on each Uyuni minion.
+   Newly installed services are covered automatically; no per-service
+   inventory is required.
+3. **Investigates** -- a LangGraph ReAct agent takes over, calling bounded,
+   read-only Salt tools on the affected minion. For a failed service it
+   correlates unit properties, journal errors, and listening sockets so it can
+   distinguish a port conflict from merely seeing that the unit is inactive.
+   For disk incidents it deterministically gathers capacity, largest files,
+   systemd unit references, unit properties, and journals before asking the
+   LLM for an RCA. For PostgreSQL it runs a fixed read-only cluster query,
+   discovers blocked and blocking sessions across every database, and proves
+   server availability before distinguishing lock contention from an outage.
+   PostgreSQL evidence includes command types and query IDs, not raw SQL text,
+   so statement literals are not sent to the external LLM or alert receivers.
+   Memory investigations deterministically correlate `MemAvailable`, current
+   page-in/page-out rates, system CPU/I/O wait, pressure stalls, and the
+   largest-RSS process. Swap occupancy alone is not labeled as active
+   thrashing, and process arguments are omitted from LLM evidence.
 4. **Reports** -- the analysis gets sent to AlertManager, which can forward it to Slack or wherever your alerts go.
 
-The agent communicates with Salt through Uyuni's built-in REST API (`rest_cherrypy`) on port 9080. This gives the agent full access to Salt execution modules (`cmd.run`, `disk.usage`, `service.status`, etc.) on all registered minions.
+The agent communicates with Salt through Uyuni's built-in REST API
+(`rest_cherrypy`) on port 9080. The Salt external-auth account needs access to
+the inspection functions used by the agent (`cmd.run`, `disk.usage`, and
+`service.status`). Keep that account read-only at the application level: the
+service discovery commands are fixed in code, unit names are validated, and
+the LLM is not allowed to choose arbitrary commands for this workflow.
 
+`service_monitoring.ignored_units` in `config/settings.yaml` is an optional
+glob-based escape hatch for deliberately failed units. The normal case needs
+no list:
+
+```yaml
+service_monitoring:
+  enabled: true
+  ignored_units: []
+
+deduplication:
+  cooldown_seconds: 900
+```
 
 ## Setup
 
@@ -30,8 +65,6 @@ podman build -t uyuni-ai-agent -f Containerfile .
 podman run -d --name ai-agent --network=container:uyuni-server -e LLM_API_KEY="your_key" -e SALT_API_PASSWORD="your_salt_password" uyuni-ai-agent --dry-run
 
 ```
-
-We tested it in a minion and here is the [result](https://github.com/sussysimpai-blip/X-project/wiki/Current-Result-from-the-agent)
 
 
 ## License
