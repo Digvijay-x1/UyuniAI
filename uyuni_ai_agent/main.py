@@ -264,8 +264,12 @@ async def run(dry_run=False):
         config.get("deduplication", {}).get("cooldown_seconds", 900)
     )
     correlation_cfg = config.get("dependency_correlation", {})
+    apache_traffic_threshold = (
+        config["thresholds"]["apache"]["requests_per_sec"]["warning"]
+    )
     dependency_correlator = DependencyCorrelationWindow(
-        correlation_cfg.get("grace_seconds", 90)
+        correlation_cfg.get("grace_seconds", 90),
+        apache_traffic_threshold=apache_traffic_threshold,
     )
 
     stop = asyncio.Event()

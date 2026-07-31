@@ -192,12 +192,17 @@ _WEB_APPLICATION_HINT = re.compile(
     r"(apache|httpd|web|backend|frontend|api|php|cgi|wsgi|gunicorn)",
     re.IGNORECASE,
 )
+_DEFAULT_APACHE_TRAFFIC_THRESHOLD = 500.0
 
 
-def _is_apache_dependency_candidate(anomaly):
+def _is_apache_dependency_candidate(
+    anomaly,
+    traffic_spike_threshold=_DEFAULT_APACHE_TRAFFIC_THRESHOLD,
+):
     return (
         anomaly.metric_name == "apache_busy_workers"
-        and float(anomaly.context.get("requests_per_second", 0.0)) < 500.0
+        and float(anomaly.context.get("requests_per_second", 0.0))
+        < float(traffic_spike_threshold)
     )
 
 
@@ -213,7 +218,11 @@ def _is_postgres_dependency_candidate(anomaly):
     )
 
 
-def correlate_dependency_anomalies(anomalies, dependency_edges=None):
+def correlate_dependency_anomalies(
+    anomalies,
+    dependency_edges=None,
+    apache_traffic_threshold=_DEFAULT_APACHE_TRAFFIC_THRESHOLD,
+):
     """Collapse an evidenced Apache/PostgreSQL symptom pair into one incident.
 
     Correlation is intentionally conservative: Apache must be worker-saturated
@@ -226,7 +235,7 @@ def correlate_dependency_anomalies(anomalies, dependency_edges=None):
     apache_indexes = [
         index
         for index, anomaly in enumerate(anomalies)
-        if _is_apache_dependency_candidate(anomaly)
+        if _is_apache_dependency_candidate(anomaly, apache_traffic_threshold)
     ]
     postgres_indexes = [
         index
@@ -340,13 +349,20 @@ class DependencyCorrelationWindow:
     traffic spikes pass through immediately.
     """
 
-    def __init__(self, grace_seconds=90):
+    def __init__(
+        self,
+        grace_seconds=90,
+        apache_traffic_threshold=_DEFAULT_APACHE_TRAFFIC_THRESHOLD,
+    ):
         self.grace_seconds = max(0.0, float(grace_seconds))
+        self.apache_traffic_threshold = max(
+            0.0,
+            float(apache_traffic_threshold),
+        )
         self._first_seen = {}
         self.last_held_count = 0
 
-    @staticmethod
-    def _is_cross_minion_candidate(anomaly, dependency_edges):
+    def _is_cross_minion_candidate(self, anomaly, dependency_edges):
         for edge in dependency_edges:
             if not isinstance(edge, dict):
                 continue
@@ -361,7 +377,10 @@ class DependencyCorrelationWindow:
                 return True
             if (
                 anomaly.minion_id == apache_minion
-                and _is_apache_dependency_candidate(anomaly)
+                and _is_apache_dependency_candidate(
+                    anomaly,
+                    self.apache_traffic_threshold,
+                )
             ):
                 return True
         return False
@@ -374,6 +393,7 @@ class DependencyCorrelationWindow:
         correlated = correlate_dependency_anomalies(
             anomalies,
             dependency_edges,
+            self.apache_traffic_threshold,
         )
         if any(
             anomaly.metric_name == "postgres_apache_chain"

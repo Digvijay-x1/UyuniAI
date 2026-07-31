@@ -142,7 +142,7 @@ def load_prompt(template_name, **kwargs):
         "prompts"
     )
     template_path = os.path.join(prompts_dir, template_name)
-    with open(template_path, "r") as f:
+    with open(template_path, "r", encoding="utf-8") as f:
         template = f.read()
     return template.format(**kwargs)
 
@@ -439,6 +439,38 @@ async def collect_required_cpu_evidence(anomaly):
     )
 
 
+_REQUIRED_EVIDENCE_COLLECTORS = {
+    "memory": collect_required_memory_evidence,
+    "memory_pressure": collect_required_memory_evidence,
+    "cpu": collect_required_cpu_evidence,
+    "apache_busy_workers": collect_required_apache_evidence,
+    "apache_requests": collect_required_apache_evidence,
+    "postgres_apache_chain": collect_required_apache_evidence,
+    "disk": collect_required_disk_evidence,
+    "postgres_blocked_transaction": collect_required_postgres_lock_evidence,
+    "postgres_connections": collect_required_postgres_connection_evidence,
+}
+
+
+async def collect_required_evidence(anomaly):
+    """Collect deterministic evidence for anomaly types that require it."""
+    collector = _REQUIRED_EVIDENCE_COLLECTORS.get(anomaly.metric_name)
+    if collector is None:
+        return ""
+    return await collector(anomaly)
+
+
+def append_required_evidence(prompt, evidence):
+    """Append one consistently formatted, bounded evidence section."""
+    if not evidence:
+        return prompt
+    return (
+        f"{prompt}\n\n## Pre-collected mandatory evidence\n\n"
+        f"{evidence}\n\n"
+        "Use this evidence in the RCA. You may call tools for clarification."
+    )
+
+
 async def investigate(anomaly, metrics, config):
     """Run the ReAct agent to investigate an anomaly, then structure the result.
 
@@ -466,57 +498,11 @@ async def investigate(anomaly, metrics, config):
 
     # Load scenario-specific prompt
     scenario_prompt = get_prompt_for_anomaly(anomaly, metrics)
-    required_evidence = ""
-    if anomaly.metric_name in {"memory", "memory_pressure"}:
-        required_evidence = await collect_required_memory_evidence(anomaly)
-        scenario_prompt += (
-            "\n\n## Pre-collected mandatory evidence\n\n"
-            f"{required_evidence}\n\n"
-            "Use this evidence in the RCA. You may call tools for clarification."
-        )
-    elif anomaly.metric_name == "cpu":
-        required_evidence = await collect_required_cpu_evidence(anomaly)
-        scenario_prompt += (
-            "\n\n## Pre-collected mandatory evidence\n\n"
-            f"{required_evidence}\n\n"
-            "Use this evidence in the RCA. You may call tools for clarification."
-        )
-    elif anomaly.metric_name in {
-        "apache_busy_workers",
-        "apache_requests",
-        "postgres_apache_chain",
-    }:
-        required_evidence = await collect_required_apache_evidence(anomaly)
-        scenario_prompt += (
-            "\n\n## Pre-collected mandatory evidence\n\n"
-            f"{required_evidence}\n\n"
-            "Use this evidence in the RCA. You may call tools for clarification."
-        )
-    elif anomaly.metric_name == "disk":
-        required_evidence = await collect_required_disk_evidence(anomaly)
-        scenario_prompt += (
-            "\n\n## Pre-collected mandatory evidence\n\n"
-            f"{required_evidence}\n\n"
-            "Use this evidence in the RCA. You may call tools for clarification."
-        )
-    elif anomaly.metric_name == "postgres_blocked_transaction":
-        required_evidence = await collect_required_postgres_lock_evidence(
-            anomaly
-        )
-        scenario_prompt += (
-            "\n\n## Pre-collected mandatory evidence\n\n"
-            f"{required_evidence}\n\n"
-            "Use this evidence in the RCA. You may call tools for clarification."
-        )
-    elif anomaly.metric_name == "postgres_connections":
-        required_evidence = await collect_required_postgres_connection_evidence(
-            anomaly
-        )
-        scenario_prompt += (
-            "\n\n## Pre-collected mandatory evidence\n\n"
-            f"{required_evidence}\n\n"
-            "Use this evidence in the RCA. You may call tools for clarification."
-        )
+    required_evidence = await collect_required_evidence(anomaly)
+    scenario_prompt = append_required_evidence(
+        scenario_prompt,
+        required_evidence,
+    )
 
     # Phase 1: run the ReAct agent (async; async tools are awaited by the tool node)
     result = await agent.ainvoke({
