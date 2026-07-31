@@ -79,6 +79,30 @@ def test_does_not_correlate_traffic_spike_or_unrelated_application():
     ]
 
 
+def test_correlation_uses_the_configured_traffic_threshold():
+    anomalies = [
+        apache_anomaly(request_rate=80.0),
+        postgres_anomaly(),
+    ]
+
+    below_configured_threshold = correlate_dependency_anomalies(
+        anomalies,
+        apache_traffic_threshold=100.0,
+    )
+    above_configured_threshold = correlate_dependency_anomalies(
+        anomalies,
+        apache_traffic_threshold=50.0,
+    )
+
+    assert [item.metric_name for item in below_configured_threshold] == [
+        "postgres_apache_chain"
+    ]
+    assert [item.metric_name for item in above_configured_threshold] == [
+        "apache_busy_workers",
+        "postgres_blocked_transaction",
+    ]
+
+
 def test_cross_minion_correlation_requires_explicit_dependency_edge():
     anomalies = [
         apache_anomaly(minion_id="web2"),

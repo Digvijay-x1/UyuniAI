@@ -16,10 +16,11 @@ def test_connection_prompt_requires_capacity_owner_and_availability_evidence():
     )
 
     prompt = get_prompt_for_anomaly(anomaly, {})
+    normalized_prompt = " ".join(prompt.split())
 
     assert "max_connections" in prompt
     assert "remaining normal slots" in prompt
     assert "idle in transaction" in prompt
     assert "application" in prompt
-    assert "Do not recommend restarting PostgreSQL" in prompt
+    assert "Do not recommend restarting PostgreSQL" in normalized_prompt
     assert "normal_capacity_exhausted=true" in prompt
