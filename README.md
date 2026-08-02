@@ -70,27 +70,44 @@ investigation_queue:
 
 observability:
   enabled: true
-  host: 127.0.0.1
+  host: 0.0.0.0
   port: 9898
   readiness_max_age_seconds: 180
 ```
 
-The observability listener is loopback-only by default and exposes three
-read-only endpoints:
+The observability listener exposes three read-only endpoints inside the Uyuni
+server container's network namespace. Port 9898 is not published by the
+sidecar deployment command:
 
 - `/healthz` reports that the agent process and listener are alive.
-- `/readyz` returns HTTP 200 only after at least one minion completed a recent
-  poll; it returns 503 at startup or when successful polling becomes stale.
+- `/readyz` returns HTTP 200 only after at least one recent, complete minion
+  snapshot and successful Salt and Prometheus dependency checks; it returns
+  503 when no usable snapshot is available or a required dependency is down.
 - `/metrics` exposes Prometheus-format queue depth and events, poll and
   investigation latency, incident counts, anomaly observations, delivery
   outcomes, and Python process metrics.
 
 These metrics intentionally exclude prompts, evidence text, commands, SQL,
-credentials, incident IDs, and resource names. With the default sidecar
-network, verify them locally with
-`podman exec ai-agent python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:9898/metrics').read().decode())"`.
-Binding the listener beyond loopback should be done only when a protected
-Prometheus scrape path has been deliberately configured.
+credentials, incident IDs, and resource names. With the sidecar network,
+verify them locally with
+`podman exec uyuni-server curl -fsS http://127.0.0.1:9898/metrics`.
+The production scrape and alert fragments are under `deploy/monitoring/`;
+expose the port only through a source-restricted proxy or private network.
+
+Dependency failures no longer terminate the process. Salt login is retried
+with bounded exponential backoff and jitter, while independent circuits for
+Salt, Prometheus, the LLM, and Alertmanager prevent retry storms. Per-operation,
+per-minion, poll-cycle, LLM, and investigation deadlines keep one slow system
+from monopolizing the agent. Endpoint-only overrides (`SALT_API_URL`,
+`PROMETHEUS_URL`, and `ALERTMANAGER_URL`) allow one immutable image to be used
+across environments without putting credentials in the image.
+
+An RCA is emitted only when fresh evidence supports its cited claims. Strict
+evidence patterns for port conflicts, disk-filling crash loops, blocked
+PostgreSQL transactions, and active swap pressure use deterministic analysis;
+ambiguous cases still use the configured OpenAI-compatible model and are
+downgraded to an inconclusive result when evidence is stale, contradictory, or
+insufficient.
 
 ## Setup
 
@@ -99,15 +116,25 @@ Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertM
 ```bash
 # Build the agent container
 
-podman build -t uyuni-ai-agent -f Containerfile .
+podman build --format=docker -t uyuni-ai-agent -f Containerfile .
 # Remove --dry-run to send real alerts to AlertManager; also, the project assumes that you have a "agent" name in the config of salt-api and you are putting its password
 podman volume create uyuni-ai-agent-state
 podman run -d --name ai-agent --network=container:uyuni-server \
-  -v uyuni-ai-agent-state:/var/lib/uyuni-ai-agent \
-  -e LLM_API_KEY="your_key" -e SALT_API_PASSWORD="your_salt_password" \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop=all --security-opt=no-new-privileges \
+  --pids-limit=256 --memory=1g --cpus=2 \
+  -v uyuni-ai-agent-state:/var/lib/uyuni-ai-agent:U \
+  --env-file /root/UyuniAI/.env \
   uyuni-ai-agent --dry-run
 
 ```
+
+The image runs as UID/GID 10001. The `:U` volume option performs the one-time
+ownership adjustment needed by the non-root SQLite state store. Keep
+`--dry-run` until the complete detection, investigation, and Alertmanager route
+have been verified. See [Operations](docs/operations.md) and
+[Evaluation](docs/evaluation.md) for health checks, upgrades, rollback, and the
+scored scenario catalog.
 
 
 ## License
