@@ -1,0 +1,8 @@
+table inet uyuni_ai_agent_metrics {
+    chain input {
+        type filter hook input priority -10; policy accept;
+
+        ip saddr 52.91.91.80 tcp dport 9898 accept
+        tcp dport 9898 counter drop
+    }
+}

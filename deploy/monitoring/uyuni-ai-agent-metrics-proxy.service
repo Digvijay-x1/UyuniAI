@@ -1,0 +1,15 @@
+[Unit]
+Description=Proxy the Uyuni AI agent metrics endpoint
+Documentation=https://www.freedesktop.org/software/systemd/man/latest/systemd-socket-proxyd.html
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/uyuni-ai-agent-metrics-proxy
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/containers/storage
+ReadWritePaths=-/run/containers/storage
+ReadWritePaths=-/run/lock/netavark.lock
+ReadWritePaths=-/run/libpod

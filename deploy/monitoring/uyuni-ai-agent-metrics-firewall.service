@@ -1,0 +1,13 @@
+[Unit]
+Description=Restrict Uyuni AI agent metrics to the monitoring VM
+Before=uyuni-ai-agent-metrics-proxy.socket
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/sbin/nft delete table inet uyuni_ai_agent_metrics
+ExecStart=/sbin/nft -f /etc/nftables/uyuni-ai-agent-metrics.nft
+ExecStop=-/sbin/nft delete table inet uyuni_ai_agent_metrics
+
+[Install]
+WantedBy=multi-user.target

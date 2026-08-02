@@ -74,6 +74,12 @@ container's TCP 9898 only from the monitoring VM (`52.91.91.80/32`), or use a
 private network/TLS reverse proxy. Verify the restriction from an unrelated
 source before enabling the scrape.
 
+The files under `deploy/monitoring/uyuni-ai-agent-metrics-*` provide the
+current lab deployment: a socket-activated `systemd-socket-proxyd` listener and
+an nftables input rule that accepts TCP 9898 only from `52.91.91.80`. The proxy
+resolves the `uyuni-server` bridge address whenever it starts, so recreating the
+container does not require a hard-coded address update.
+
 Merge `deploy/monitoring/prometheus-agent-scrape.yml` into Prometheus's
 `scrape_configs`, copy `deploy/monitoring/agent-self-alerts.yml` into its rule
 directory, and add that file under `rule_files`. Validate before reload:
@@ -83,6 +89,11 @@ promtool check config /etc/prometheus/prometheus.yml
 promtool check rules /etc/prometheus/rules/agent-self-alerts.yml
 curl -fsS -X POST http://127.0.0.1:9090/-/reload
 ```
+
+For the current openSUSE monitoring VM, copy both YAML fragments to `/tmp` and
+run `deploy/monitoring/install-agent-monitoring.sh` as root. The installer is
+idempotent, validates a candidate configuration before replacement, preserves
+a timestamped backup, and restores that backup automatically if reload fails.
 
 Confirm `up{job="uyuni-ai-agent"} == 1` and exercise `readyz` degradation before
 considering self-monitoring complete.

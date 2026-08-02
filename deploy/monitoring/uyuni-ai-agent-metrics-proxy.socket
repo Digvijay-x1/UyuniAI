@@ -1,0 +1,12 @@
+[Unit]
+Description=Protected listener for Uyuni AI agent metrics
+Requires=uyuni-ai-agent-metrics-firewall.service
+After=network-online.target uyuni-ai-agent-metrics-firewall.service
+
+[Socket]
+ListenStream=0.0.0.0:9898
+NoDelay=yes
+Service=uyuni-ai-agent-metrics-proxy.service
+
+[Install]
+WantedBy=sockets.target
