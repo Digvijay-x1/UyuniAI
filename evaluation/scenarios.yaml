@@ -1,0 +1,171 @@
+- id: isolated_cpu_saturation
+  level: baseline
+  injected_failure: One process consumes sustained CPU without memory pressure, I/O wait, or downstream blocking.
+  expected_alerts: [cpu]
+  expected_tools: [cpu_pressure_snapshot]
+  expectation:
+    conclusion: confirmed
+    component_pattern: ".+"
+    required_concept_groups:
+      - ["cpu"]
+      - ["process", "workload"]
+    forbidden_phrases: ["swap thrashing", "database lock"]
+    remediation_concept_groups:
+      - ["limit", "load", "process"]
+    minimum_evidence_records: 2
+    minimum_confidence: 0.7
+
+- id: service_port_conflict
+  level: correlation
+  injected_failure: A healthy service is stopped while an unrelated process binds its configured TCP port.
+  expected_alerts: [service_down]
+  expected_tools: [service_details, service_logs, listening_tcp_ports]
+  expectation:
+    conclusion: confirmed
+    component_pattern: "(?i)service|my-web"
+    required_concept_groups:
+      - ["address already in use", "port conflict", "already listening"]
+      - ["tcp port", "listener"]
+    forbidden_phrases: ["service is merely inactive"]
+    remediation_concept_groups:
+      - ["unintended listener", "reconfigure", "port"]
+    minimum_evidence_records: 2
+    minimum_confidence: 0.8
+
+- id: disk_crash_loop
+  level: root_cause_chain
+  injected_failure: A restarting systemd unit appends to one log until its filesystem is full.
+  expected_alerts: [disk, service_down]
+  expected_tools: [disk_usage, largest_files, service_references, service_details, service_logs]
+  expectation:
+    conclusion: confirmed
+    component_pattern: "(?i)service|crash"
+    required_concept_groups:
+      - ["restart", "crash loop"]
+      - ["largest file", "application.log", "log"]
+      - ["filesystem", "disk"]
+    forbidden_phrases: ["partition is simply full"]
+    remediation_concept_groups:
+      - ["stop", "halt"]
+      - ["rotation", "bounded"]
+    minimum_evidence_records: 3
+    minimum_confidence: 0.8
+
+- id: postgres_blocked_transaction
+  level: correlation
+  injected_failure: An idle-in-transaction backend holds a lock required by an active UPDATE.
+  expected_alerts: [postgres_blocked_transaction]
+  expected_tools: [postgres_health, postgres_blocking_activity]
+  expectation:
+    conclusion: confirmed
+    component_pattern: "(?i)postgres"
+    required_concept_groups:
+      - ["idle-in-transaction", "idle in transaction"]
+      - ["blocked", "lock"]
+      - ["accepting queries", "available"]
+    forbidden_phrases: ["restart postgresql", "postgresql is stopped"]
+    remediation_concept_groups:
+      - ["commit", "roll back", "transaction"]
+    minimum_evidence_records: 2
+    minimum_confidence: 0.8
+
+- id: memory_swap_thrashing
+  level: correlation
+  injected_failure: One process consumes most RAM and causes active page-in/page-out activity and CPU degradation.
+  expected_alerts: [memory_pressure]
+  expected_tools: [memory_pressure_snapshot]
+  expectation:
+    conclusion: confirmed
+    component_pattern: ".+"
+    required_concept_groups:
+      - ["memory pressure"]
+      - ["active swap", "swap i/o", "swapping"]
+      - ["largest rss", "resident set", "rss consumer"]
+    forbidden_phrases: ["cpu-bound workload"]
+    remediation_concept_groups:
+      - ["memory", "limit", "retaining"]
+    minimum_evidence_records: 2
+    minimum_confidence: 0.75
+
+- id: postgres_apache_chain
+  level: root_cause_chain
+  injected_failure: PostgreSQL lock waits hold application requests and saturate Apache workers on a dependent minion.
+  expected_alerts: [postgres_blocked_transaction, apache_busy_workers, postgres_apache_chain]
+  expected_tools: [apache_overload_snapshot, postgres_health, postgres_blocking_activity, postgres_connection_activity]
+  expectation:
+    conclusion: confirmed
+    component_pattern: "(?i)postgres"
+    required_concept_groups:
+      - ["postgres", "database"]
+      - ["lock", "blocked"]
+      - ["apache", "worker"]
+    forbidden_phrases: ["traffic spike", "restart apache"]
+    remediation_concept_groups:
+      - ["transaction", "blocker"]
+    minimum_evidence_records: 3
+    minimum_confidence: 0.8
+
+- id: salt_dependency_outage
+  level: adversarial
+  injected_failure: Salt API is unreachable while Prometheus remains healthy, then Salt recovers.
+  expected_alerts: [telemetry_unavailable]
+  expected_tools: []
+  expectation:
+    conclusion: confirmed
+    component_pattern: "(?i)salt"
+    required_concept_groups:
+      - ["salt"]
+      - ["inspection", "telemetry"]
+    forbidden_phrases: ["all services are healthy", "restart the minion"]
+    remediation_concept_groups:
+      - ["connectivity", "inspection path", "jobs return"]
+    minimum_evidence_records: 1
+    minimum_confidence: 0.9
+
+- id: stale_prometheus_sample
+  level: adversarial
+  injected_failure: Prometheus returns an old successful sample after the exporter stops scraping.
+  expected_alerts: [telemetry_unavailable]
+  expected_tools: []
+  expectation:
+    conclusion: confirmed
+    component_pattern: "(?i)exporter|prometheus|telemetry"
+    required_concept_groups:
+      - ["stale", "old sample", "scraping"]
+    forbidden_phrases: ["host is healthy"]
+    remediation_concept_groups:
+      - ["restore scraping", "target status", "exporter"]
+    minimum_evidence_records: 1
+    minimum_confidence: 0.9
+
+- id: unrelated_cross_node_alerts
+  level: adversarial
+  injected_failure: An independent CPU spike and disk alert occur simultaneously on nodes without a dependency edge.
+  expected_alerts: [cpu, disk]
+  expected_tools: [cpu_pressure_snapshot, disk_usage, largest_files]
+  expectation:
+    conclusion: inconclusive
+    component_pattern: "(?i)unknown"
+    required_concept_groups:
+      - ["independent", "no dependency", "inconclusive"]
+    forbidden_phrases: ["common root cause confirmed"]
+    remediation_concept_groups:
+      - ["validate", "repeat", "evidence"]
+    minimum_evidence_records: 1
+    minimum_confidence: 0.0
+
+- id: alert_storm_backpressure
+  level: adversarial
+  injected_failure: More unique anomalies arrive than the bounded investigation queue can hold.
+  expected_alerts: [telemetry_unavailable]
+  expected_tools: []
+  expectation:
+    conclusion: inconclusive
+    component_pattern: "(?i)unknown|agent"
+    required_concept_groups:
+      - ["backpressure", "queue", "overload"]
+    forbidden_phrases: ["all incidents were processed"]
+    remediation_concept_groups:
+      - ["retry", "capacity", "queue"]
+    minimum_evidence_records: 0
+    minimum_confidence: 0.0
