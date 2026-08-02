@@ -33,7 +33,7 @@ def get_llm(config):
     api_key = config["llm"].get("api_key", os.environ.get("LLM_API_KEY", ""))
 
     if provider == "huggingface":
-        from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+        from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
         llm_model = HuggingFaceEndpoint(
             repo_id=model,
             huggingfacehub_api_token=api_key,

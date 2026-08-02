@@ -9,7 +9,6 @@ from uyuni_ai_agent.anomaly_detector import (
 from uyuni_ai_agent.memory_inspection import build_memory_pressure_command
 from uyuni_ai_agent.prometheus_client import get_memory_pressure_metrics
 
-
 THRESHOLDS = {
     "warning": 70,
     "critical": 95,

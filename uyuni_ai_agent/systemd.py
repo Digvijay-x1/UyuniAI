@@ -2,7 +2,6 @@
 
 import re
 
-
 _SYSTEMD_SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@:-]+\.service$")
 _SYSTEMD_BARE_SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 

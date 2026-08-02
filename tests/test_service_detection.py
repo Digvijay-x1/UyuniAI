@@ -9,7 +9,6 @@ from uyuni_ai_agent.anomaly_detector import (
 )
 from uyuni_ai_agent.systemd import validate_systemd_service
 
-
 SYSTEMCTL_OUTPUT = """\
 my-web.service loaded failed failed My test web service
 ● backup@nightly.service loaded failed failed Nightly backup

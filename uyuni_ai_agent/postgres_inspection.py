@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import shlex
 
-
 _BLOCKING_ACTIVITY_SQL = r"""
 WITH lock_pairs AS (
     SELECT

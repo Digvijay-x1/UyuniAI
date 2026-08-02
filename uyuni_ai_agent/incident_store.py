@@ -7,25 +7,25 @@ or a change to the monitoring topology.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import datetime
 import hashlib
 import json
-from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from uyuni_ai_agent.anomaly_detector import Anomaly
-
 
 _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 
 
 def _rfc3339(timestamp: float) -> str:
     return (
-        datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
+        datetime.datetime.fromtimestamp(timestamp, datetime.UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )

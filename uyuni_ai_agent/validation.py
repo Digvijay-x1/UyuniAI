@@ -21,7 +21,6 @@ import re
 import shlex
 from collections.abc import Collection
 
-
 _HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 

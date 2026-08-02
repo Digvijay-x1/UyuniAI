@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from enum import Enum
 import heapq
 import itertools
 import logging
-from typing import Any, Awaitable, Callable
-
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ _SEVERITY_PRIORITY = {
 }
 
 
-class EnqueueStatus(str, Enum):
+class EnqueueStatus(StrEnum):
     ENQUEUED = "enqueued"
     COALESCED = "coalesced"
     IN_FLIGHT = "in_flight"
@@ -29,7 +29,7 @@ class EnqueueStatus(str, Enum):
     REJECTED_CLOSED = "rejected_closed"
 
 
-class CancelStatus(str, Enum):
+class CancelStatus(StrEnum):
     CANCELLED = "cancelled"
     IN_FLIGHT = "in_flight"
     NOT_FOUND = "not_found"
@@ -259,7 +259,7 @@ class InvestigationQueue:
                 timeout=max(0.01, float(grace_seconds)),
             )
             result = ShutdownResult(drained=True, abandoned=0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             abandoned = len(self._heap) + len(self._in_flight)
             for task in tasks:
                 task.cancel()

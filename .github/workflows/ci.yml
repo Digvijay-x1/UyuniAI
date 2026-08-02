@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.txt
+      - name: Install hash-locked runtime dependencies
+        run: python -m pip install --require-hashes -r requirements.lock
+      - name: Install development tools
+        run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: pytest -q -p no:cacheprovider
+
+  supply-chain:
+    name: Dependency audit and SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Audit locked dependencies
+        run: pip-audit --require-hashes -r requirements.lock
+      - name: Generate CycloneDX SBOM
+        run: cyclonedx-py requirements requirements.lock --output-file sbom.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: uyuni-ai-agent-sbom
+          path: sbom.json
+          retention-days: 30
+
+  container:
+    name: Build hardened container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build image
+        run: docker build --file Containerfile --tag uyuni-ai-agent:ci .
+      - name: Verify non-root runtime user
+        run: test "$(docker image inspect --format '{{.Config.User}}' uyuni-ai-agent:ci)" = "10001:10001"
