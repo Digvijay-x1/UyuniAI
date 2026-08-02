@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
-from fnmatch import fnmatch
 import re
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
 from enum import Enum
+from fnmatch import fnmatch
+from typing import Any
 
-from uyuni_ai_agent.prometheus_client import get_all_metrics
 from uyuni_ai_agent.postgres_inspection import parse_postgres_lock_pairs
+from uyuni_ai_agent.prometheus_client import get_all_metrics
 
 
 class AlertSeverity(Enum):
@@ -37,9 +37,9 @@ class Anomaly:
     threshold: float
     severity: AlertSeverity
     description: str
-    service_name: Optional[str] = None
-    resource: Optional[str] = None
-    context: Dict[str, Any] = field(default_factory=dict)
+    service_name: str | None = None
+    resource: str | None = None
+    context: dict[str, Any] = field(default_factory=dict)
 
     def identity_key(self):
         """Stable identity used to deduplicate repeated polling results."""
@@ -127,7 +127,7 @@ def _salt_inspection_failure(output):
     return None
 
 
-def _salt_telemetry_anomaly(minion_id, check, failure):
+def salt_telemetry_anomaly(minion_id, check, failure):
     return Anomaly(
         minion_id=minion_id,
         metric_name="telemetry_unavailable",
@@ -158,7 +158,7 @@ async def check_failed_services(minion_id, salt_client, config):
     output = await salt_client.failed_systemd_services(minion_id)
     failure = _salt_inspection_failure(output)
     if failure:
-        return [_salt_telemetry_anomaly(
+        return [salt_telemetry_anomaly(
             minion_id, "systemd_service_discovery", failure
         )]
     ignored = service_cfg.get("ignored_units", [])
@@ -485,7 +485,7 @@ async def check_postgres_blocked_transactions(minion_id, salt_client, config):
     output = await salt_client.postgres_blocking_activity(minion_id)
     failure = _salt_inspection_failure(output)
     if failure:
-        return [_salt_telemetry_anomaly(
+        return [salt_telemetry_anomaly(
             minion_id, "postgres_lock_discovery", failure
         )]
     pairs = parse_postgres_lock_pairs(output)

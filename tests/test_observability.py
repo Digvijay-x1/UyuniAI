@@ -47,6 +47,7 @@ def test_metrics_capture_runtime_state_without_unbounded_evidence():
         result="Success: delivered",
         duration_seconds=0.4,
     )
+    metrics.record_timeout("investigation")
     rendered = metrics.render_metrics().decode("utf-8")
 
     assert outcome == "partial"
@@ -59,6 +60,7 @@ def test_metrics_capture_runtime_state_without_unbounded_evidence():
     )
     assert 'uyuni_ai_agent_incidents{status="active"} 2.0' in rendered
     assert 'outcome="success",state="firing"' in rendered
+    assert 'uyuni_ai_agent_timeouts_total{scope="investigation"} 1.0' in rendered
     assert "prompt" not in rendered.lower()
     assert "command" not in rendered.lower()
 

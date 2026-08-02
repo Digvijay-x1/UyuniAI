@@ -194,6 +194,92 @@ def test_stale_queued_snapshot_is_skipped_and_remains_retryable(monkeypatch):
     assert len(asyncio.run(scenario())) == 1
 
 
+def test_investigation_timeout_is_cancelled_and_remains_retryable(monkeypatch):
+    async def scenario():
+        store = IncidentStore(":memory:", cooldown_seconds=900)
+        firing = store.reconcile("client", [anomaly()]).firing[0]
+        cancelled = asyncio.Event()
+
+        async def never_finishes(*_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        class RecordingObservability:
+            def __init__(self):
+                self.timeouts = []
+                self.investigations = []
+
+            def record_timeout(self, scope):
+                self.timeouts.append(scope)
+
+            def record_investigation(self, **values):
+                self.investigations.append(values)
+
+        telemetry = RecordingObservability()
+        monkeypatch.setattr(main, "investigate", never_finishes)
+        outcome = await main.process_firing_investigation(
+            main.InvestigationWork(
+                firing=firing,
+                metrics={},
+                detected_at=time.time(),
+            ),
+            object(),
+            {},
+            False,
+            asyncio.Semaphore(1),
+            store,
+            300,
+            telemetry,
+            timeout_config={
+                "llm_seconds": 10,
+                "investigation_seconds": 0.001,
+            },
+        )
+        retry = store.reconcile("client", [anomaly()]).firing
+        store.close()
+        return outcome, cancelled.is_set(), telemetry, retry
+
+    outcome, cancelled, telemetry, retry = asyncio.run(scenario())
+    assert outcome == "timeout"
+    assert cancelled is True
+    assert telemetry.timeouts == ["investigation"]
+    assert telemetry.investigations[0]["outcome"] == "timeout"
+    assert len(retry) == 1
+
+
+def test_malformed_llm_result_does_not_acknowledge_the_incident(monkeypatch):
+    async def scenario():
+        store = IncidentStore(":memory:", cooldown_seconds=900)
+        firing = store.reconcile("client", [anomaly()]).firing[0]
+
+        async def malformed(*_args, **_kwargs):
+            raise ValueError("structured output did not match the RCA schema")
+
+        monkeypatch.setattr(main, "investigate", malformed)
+        outcome = await main.process_firing_investigation(
+            main.InvestigationWork(
+                firing=firing,
+                metrics={},
+                detected_at=time.time(),
+            ),
+            object(),
+            {},
+            False,
+            asyncio.Semaphore(1),
+            store,
+            300,
+        )
+        retry = store.reconcile("client", [anomaly()]).firing
+        store.close()
+        return outcome, retry
+
+    outcome, retry = asyncio.run(scenario())
+    assert outcome == "investigation_failed"
+    assert len(retry) == 1
+
+
 def test_detection_reconciliation_does_not_wait_for_slow_investigation():
     async def scenario():
         store = IncidentStore(":memory:", cooldown_seconds=900)

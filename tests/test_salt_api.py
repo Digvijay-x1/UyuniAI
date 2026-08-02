@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from uyuni_ai_agent.resilience import CircuitState, DependencyManager
 from uyuni_ai_agent.salt_api import (
     SaltAPIClient,
     SaltAPIError,
@@ -68,3 +69,49 @@ def test_false_cmd_run_result_is_normalized_to_inspection_failure(monkeypatch):
     result = asyncio.run(client.run_command("client", "true"))
 
     assert result == "Salt API call failed: minion returned no cmd.run result"
+
+
+def test_false_service_status_is_valid_evidence_not_dependency_failure(
+    monkeypatch,
+):
+    async def scenario():
+        manager = DependencyManager(
+            ["salt"],
+            failure_threshold=1,
+            recovery_timeout_seconds=30,
+        )
+        client = SaltAPIClient(salt_config(), dependency_manager=manager)
+
+        async def stopped_service(*_args, **_kwargs):
+            return False
+
+        monkeypatch.setattr(client, "_call", stopped_service)
+        result = await client.service_status("client", "apache2.service")
+        return result, manager.snapshot("salt")
+
+    result, snapshot = asyncio.run(scenario())
+    assert result is False
+    assert snapshot.state is CircuitState.CLOSED
+    assert snapshot.consecutive_failures == 0
+
+
+def test_false_cmd_result_is_minion_telemetry_not_api_dependency(monkeypatch):
+    async def scenario():
+        manager = DependencyManager(
+            ["salt"],
+            failure_threshold=1,
+            recovery_timeout_seconds=30,
+        )
+        client = SaltAPIClient(salt_config(), dependency_manager=manager)
+
+        async def no_minion_return(*_args, **_kwargs):
+            return False
+
+        monkeypatch.setattr(client, "_call", no_minion_return)
+        result = await client.run_command("client", "true")
+        return result, manager.snapshot("salt")
+
+    result, snapshot = asyncio.run(scenario())
+    assert result == "Salt API call failed: minion returned no cmd.run result"
+    assert snapshot.state is CircuitState.CLOSED
+    assert snapshot.consecutive_failures == 0

@@ -21,17 +21,18 @@ from collections.abc import Mapping
 import httpx
 
 from uyuni_ai_agent.apache_inspection import build_apache_overload_command
+from uyuni_ai_agent.cpu_inspection import build_cpu_pressure_command
 from uyuni_ai_agent.disk_inspection import (
     build_large_files_command,
     build_service_references_command,
 )
+from uyuni_ai_agent.memory_inspection import build_memory_pressure_command
 from uyuni_ai_agent.postgres_inspection import (
     build_postgres_blocking_command,
     build_postgres_connection_activity_command,
     build_postgres_health_command,
 )
-from uyuni_ai_agent.memory_inspection import build_memory_pressure_command
-from uyuni_ai_agent.cpu_inspection import build_cpu_pressure_command
+from uyuni_ai_agent.resilience import DependencyManager, DependencyUnavailable
 from uyuni_ai_agent.systemd import validate_systemd_service
 from uyuni_ai_agent.validation import bounded_int, validate_configured_minion
 
@@ -72,7 +73,11 @@ class SaltAPIClient:
     only one re-login.
     """
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        dependency_manager: DependencyManager | None = None,
+    ):
         api_cfg = config["salt_api"]
         concurrency_cfg = config.get("concurrency", {})
         self.url = api_cfg["url"]
@@ -89,6 +94,10 @@ class SaltAPIClient:
         self._client: httpx.AsyncClient | None = None
         self._login_lock = asyncio.Lock()
         self.logged_in = False
+        self._dependency_manager = dependency_manager
+        self._operation_timeout_seconds = float(
+            config.get("timeouts", {}).get("salt_operation_seconds", 70)
+        )
 
     async def start(self):
         """Create the HTTP client and log in eagerly.
@@ -96,7 +105,10 @@ class SaltAPIClient:
         Eager login eliminates the lazy-login race where many concurrent tool
         calls would all try to log in at once.
         """
-        self._client = httpx.AsyncClient(verify=False, timeout=httpx.Timeout(60.0))
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                verify=False, timeout=httpx.Timeout(60.0)
+            )
         await self.login()
 
     async def aclose(self):
@@ -110,17 +122,22 @@ class SaltAPIClient:
         if self._client is None:
             raise SaltAPIError("Salt API client has not been started")
         logger.debug("salt_api: logging in to %s", self.url)
-        resp = await self._client.post(
-            f"{self.url}/login",
-            data={
-                "username": self.username,
-                "password": self.password,
-                "eauth": self.eauth,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        self.logged_in = True
+        self.logged_in = False
+        try:
+            resp = await self._client.post(
+                f"{self.url}/login",
+                data={
+                    "username": self.username,
+                    "password": self.password,
+                    "eauth": self.eauth,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            self.logged_in = True
+        except Exception:
+            self.logged_in = False
+            raise
         logger.debug("salt_api: login successful")
 
     async def _ensure_login(self):
@@ -185,8 +202,21 @@ class SaltAPIClient:
     async def _safe_call(self, minion_id, fun, arg=None):
         """Run one Salt function and convert expected I/O failures to evidence."""
         try:
-            return await self._call(minion_id, fun, arg)
-        except (httpx.HTTPError, SaltAPIError, ValueError) as exc:
+            if self._dependency_manager is None:
+                return await self._call(minion_id, fun, arg)
+            return await self._dependency_manager.execute(
+                "salt",
+                lambda: self._call(minion_id, fun, arg),
+                timeout_seconds=self._operation_timeout_seconds,
+            )
+        except (
+            httpx.HTTPError,
+            SaltAPIError,
+            DependencyUnavailable,
+            ValueError,
+        ) as exc:
+            if isinstance(exc, (httpx.HTTPError, DependencyUnavailable)):
+                self.logged_in = False
             logger.warning(
                 "Salt API call failed: minion=%s function=%s error=%s",
                 minion_id,

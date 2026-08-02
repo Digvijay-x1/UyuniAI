@@ -3,6 +3,7 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
+from uyuni_ai_agent.config import _apply_runtime_overrides
 from uyuni_ai_agent.config_schema import validate_config
 
 
@@ -92,6 +93,28 @@ def valid_config():
             "port": 9898,
             "readiness_max_age_seconds": 180,
         },
+        "resilience": {
+            "failure_threshold": 3,
+            "recovery_timeout_seconds": 30,
+            "initial_backoff_seconds": 1,
+            "maximum_backoff_seconds": 60,
+            "jitter_ratio": 0.2,
+            "salt_login_timeout_seconds": 20,
+        },
+        "timeouts": {
+            "salt_operation_seconds": 70,
+            "prometheus_operation_seconds": 30,
+            "minion_seconds": 90,
+            "poll_cycle_seconds": 180,
+            "llm_seconds": 240,
+            "investigation_seconds": 300,
+            "alertmanager_seconds": 30,
+        },
+        "quality_gates": {
+            "max_evidence_age_seconds": 300,
+            "minimum_supporting_records": 1,
+            "deterministic_analysis_enabled": True,
+        },
         "concurrency": {
             "max_minions": 8,
             "max_salt_calls": 8,
@@ -143,6 +166,20 @@ def test_valid_config_is_normalized_and_preserves_dictionary_interface():
             lambda config: config["observability"].update({"port": 70000}),
             "less than or equal to 65535",
         ),
+        (
+            lambda config: config["resilience"].update({
+                "initial_backoff_seconds": 10,
+                "maximum_backoff_seconds": 5,
+            }),
+            "maximum_backoff_seconds must be >= initial_backoff_seconds",
+        ),
+        (
+            lambda config: config["timeouts"].update({
+                "minion_seconds": 100,
+                "poll_cycle_seconds": 90,
+            }),
+            "poll_cycle_seconds must be >= minion_seconds",
+        ),
     ],
 )
 def test_invalid_production_config_fails_at_startup(mutate, expected):
@@ -159,3 +196,21 @@ def test_unknown_config_keys_are_rejected_as_likely_typos():
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         validate_config(config)
+
+
+def test_runtime_endpoint_overrides_support_immutable_images():
+    config = valid_config()
+
+    _apply_runtime_overrides(
+        config,
+        {
+            "PROMETHEUS_URL": "http://prometheus.override:9090",
+            "ALERTMANAGER_URL": "http://alertmanager.override:9093",
+            "SALT_API_URL": "https://salt.override:9080",
+        },
+    )
+
+    validated = validate_config(config)
+    assert validated["prometheus"]["url"] == "http://prometheus.override:9090"
+    assert validated["alertmanager"]["url"] == "http://alertmanager.override:9093"
+    assert validated["salt_api"]["url"] == "https://salt.override:9080"

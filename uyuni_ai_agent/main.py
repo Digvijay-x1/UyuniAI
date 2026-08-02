@@ -12,16 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import argparse
-import os
 import asyncio
+import logging
+import os
 import signal
 import time
 from dataclasses import dataclass
 
 import httpx
 
+from uyuni_ai_agent.alert_manager import (
+    alert_delivery_succeeded,
+    build_alert_payload,
+    build_resolved_payload,
+    send_alert_payload,
+)
+from uyuni_ai_agent.anomaly_detector import (
+    DependencyCorrelationWindow,
+    check_all_metrics,
+    check_failed_services,
+    check_postgres_blocked_transactions,
+    salt_telemetry_anomaly,
+)
 from uyuni_ai_agent.config import load_config
 from uyuni_ai_agent.incident_store import IncidentStore
 from uyuni_ai_agent.investigation_queue import (
@@ -29,21 +42,14 @@ from uyuni_ai_agent.investigation_queue import (
     EnqueueStatus,
     InvestigationQueue,
 )
-from uyuni_ai_agent.observability import AgentObservability, ObservabilityServer
 from uyuni_ai_agent.logging_config import setup_logging
+from uyuni_ai_agent.observability import AgentObservability, ObservabilityServer
 from uyuni_ai_agent.prometheus_client import get_all_metrics
-from uyuni_ai_agent.anomaly_detector import (
-    check_all_metrics,
-    check_failed_services,
-    check_postgres_blocked_transactions,
-    DependencyCorrelationWindow,
-)
 from uyuni_ai_agent.react_agent import investigate
-from uyuni_ai_agent.alert_manager import (
-    alert_delivery_succeeded,
-    build_alert_payload,
-    build_resolved_payload,
-    send_alert_payload,
+from uyuni_ai_agent.resilience import (
+    DependencyManager,
+    DependencyUnavailable,
+    ExponentialBackoff,
 )
 from uyuni_ai_agent.salt_api import SaltAPIClient, set_salt_client
 
@@ -55,6 +61,15 @@ class InvestigationWork:
     firing: object
     metrics: dict
     detected_at: float
+
+
+def _prometheus_snapshot_available(metrics):
+    """Return true when Prometheus answered at least one metric query."""
+    telemetry = metrics.get("telemetry", {}) if isinstance(metrics, dict) else {}
+    return any(
+        isinstance(reading, dict) and reading.get("status") != "error"
+        for reading in telemetry.values()
+    )
 
 
 def _metric_text(value, suffix="%"):
@@ -69,12 +84,27 @@ async def _send_observed_alert(
     config,
     payload,
     observability,
+    dependency_manager=None,
     *,
     state,
+    timeout_seconds=None,
 ):
     """Deliver an alert and record the actual result without parsing logs."""
     started = time.monotonic()
-    result = await send_alert_payload(http_client, config, payload)
+    try:
+        if dependency_manager is None:
+            result = await send_alert_payload(http_client, config, payload)
+        else:
+            result = await dependency_manager.execute(
+                "alertmanager",
+                lambda: send_alert_payload(http_client, config, payload),
+                timeout_seconds=timeout_seconds,
+                success_predicate=alert_delivery_succeeded,
+            )
+    except DependencyUnavailable as exc:
+        result = f"Error: {exc}"
+    except Exception as exc:
+        result = f"Error: Alertmanager delivery failed: {exc}"
     if observability is not None:
         observability.record_alert_delivery(
             state=state,
@@ -90,6 +120,9 @@ async def detect_minion(
     config,
     minion_sem,
     salt_client,
+    dependency_manager=None,
+    salt_available=True,
+    prometheus_timeout_seconds=None,
 ):
     """Ingest and detect one minion, returning a cycle snapshot.
 
@@ -108,11 +141,23 @@ async def detect_minion(
             # Step 1: INGEST
             logger.debug("Step 1: querying Prometheus...")
             try:
-                metrics = await get_all_metrics(
-                    instance, http_client, config,
-                    apache_instance=apache_instance,
-                    postgres_instance=postgres_instance,
-                )
+                async def operation():
+                    return await get_all_metrics(
+                        instance,
+                        http_client,
+                        config,
+                        apache_instance=apache_instance,
+                        postgres_instance=postgres_instance,
+                    )
+                if dependency_manager is None:
+                    metrics = await operation()
+                else:
+                    metrics = await dependency_manager.execute(
+                        "prometheus",
+                        operation,
+                        timeout_seconds=prometheus_timeout_seconds,
+                        success_predicate=_prometheus_snapshot_available,
+                    )
                 logger.info(
                     (
                         "Metrics: mem=%s, swap=%s, "
@@ -167,11 +212,18 @@ async def detect_minion(
                     postgres_instance=postgres_instance,
                     metrics=metrics,
                 )
-                service_anomalies = await check_failed_services(
-                    minion_id, salt_client, config
-                )
+                if salt_available:
+                    service_anomalies = await check_failed_services(
+                        minion_id, salt_client, config
+                    )
+                else:
+                    service_anomalies = [salt_telemetry_anomaly(
+                        minion_id,
+                        "salt_api_login",
+                        "Salt API authentication or connectivity is unavailable",
+                    )]
                 postgres_lock_anomalies = []
-                if postgres_instance:
+                if postgres_instance and salt_available:
                     postgres_lock_anomalies = (
                         await check_postgres_blocked_transactions(
                             minion_id, salt_client, config
@@ -181,6 +233,11 @@ async def detect_minion(
                     metric_anomalies
                     + service_anomalies
                     + postgres_lock_anomalies
+                )
+                salt_snapshot_complete = salt_available and not any(
+                    anomaly.metric_name == "telemetry_unavailable"
+                    and anomaly.context.get("source") == "salt"
+                    for anomaly in detected_anomalies
                 )
                 restarting_services = [
                     anomaly.service_name
@@ -206,6 +263,10 @@ async def detect_minion(
                 "minion": minion,
                 "metrics": metrics,
                 "anomalies": detected_anomalies,
+                "complete": (
+                    salt_snapshot_complete
+                    and _prometheus_snapshot_available(metrics)
+                ),
             }
     except Exception as e:
         failed_id = minion.get("id", "<unknown>") if isinstance(minion, dict) else "<unknown>"
@@ -222,6 +283,8 @@ async def _process_firing_investigation(
     incident_store,
     max_job_age_seconds,
     observability,
+    dependency_manager,
+    timeout_config,
 ):
     """Investigate and deliver one queued incident when it is still current."""
     firing = work.firing
@@ -253,10 +316,25 @@ async def _process_firing_investigation(
         firing.fingerprint,
     )
     analysis = None
+    llm_timed_out = False
     try:
         async with llm_sem:
-            analysis = await investigate(anomaly, work.metrics, config)
+            async def operation():
+                return await investigate(anomaly, work.metrics, config)
+            if dependency_manager is None:
+                analysis = await operation()
+            else:
+                analysis = await dependency_manager.execute(
+                    "llm",
+                    operation,
+                    timeout_seconds=timeout_config.get("llm_seconds", 240),
+                )
         logger.info("Analysis:\n%s", analysis.to_text())
+    except TimeoutError:
+        llm_timed_out = True
+        if observability is not None:
+            observability.record_timeout("llm")
+        logger.error("ReAct agent exceeded its LLM deadline", exc_info=True)
     except Exception as e:
         logger.error("ReAct agent failed: %s", e, exc_info=True)
 
@@ -265,7 +343,7 @@ async def _process_firing_investigation(
             "Skipping alert for %s: investigation produced no analysis.",
             anomaly.description,
         )
-        return "investigation_failed"
+        return "llm_timeout" if llm_timed_out else "investigation_failed"
     if not incident_store.is_actionable(
         firing.fingerprint, firing.starts_at
     ):
@@ -300,7 +378,9 @@ async def _process_firing_investigation(
             config,
             build_resolved_payload(previous_payload),
             observability,
+            dependency_manager,
             state="resolved",
+            timeout_seconds=timeout_config.get("alertmanager_seconds", 30),
         )
         logger.info(
             "AlertManager label-transition resolution: %s",
@@ -341,7 +421,9 @@ async def _process_firing_investigation(
             config,
             payload,
             observability,
+            dependency_manager,
             state="firing",
+            timeout_seconds=timeout_config.get("alertmanager_seconds", 30),
         )
         logger.info("AlertManager: %s", result)
         if alert_delivery_succeeded(result):
@@ -363,6 +445,8 @@ async def process_firing_investigation(
     incident_store,
     max_job_age_seconds,
     observability=None,
+    dependency_manager=None,
+    timeout_config=None,
 ):
     """Measure one investigation while preserving queue retry semantics."""
     started = time.monotonic()
@@ -370,8 +454,9 @@ async def process_firing_investigation(
     severity = str(
         getattr(work.firing.anomaly.severity, "value", "unknown")
     )
+    timeout_config = timeout_config or {}
     try:
-        outcome = await _process_firing_investigation(
+        pending = _process_firing_investigation(
             work,
             http_client,
             config,
@@ -380,8 +465,31 @@ async def process_firing_investigation(
             incident_store,
             max_job_age_seconds,
             observability,
+            dependency_manager,
+            timeout_config,
+        )
+        investigation_timeout = timeout_config.get(
+            "investigation_seconds"
+        )
+        if investigation_timeout is None:
+            outcome = await pending
+        else:
+            outcome = await asyncio.wait_for(
+                pending, timeout=max(0.001, float(investigation_timeout))
+            )
+        return outcome
+    except TimeoutError:
+        outcome = "timeout"
+        if observability is not None:
+            observability.record_timeout("investigation")
+        logger.error(
+            "Investigation %s exceeded its overall deadline",
+            work.firing.fingerprint,
         )
         return outcome
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
     finally:
         if observability is not None:
             observability.record_investigation(
@@ -400,6 +508,8 @@ async def process_minion_anomalies(
     incident_store,
     investigation_queue,
     observability=None,
+    dependency_manager=None,
+    timeout_config=None,
 ):
     """Reconcile one minion and queue only actionable firing work."""
     minion_id = snapshot["minion"]["id"]
@@ -451,7 +561,11 @@ async def process_minion_anomalies(
                 config,
                 resolved_payload,
                 observability,
+                dependency_manager,
                 state="resolved",
+                timeout_seconds=(timeout_config or {}).get(
+                    "alertmanager_seconds", 30
+                ),
             )
             logger.info("AlertManager resolution: %s", result)
             if alert_delivery_succeeded(result):
@@ -530,6 +644,95 @@ async def process_minion_anomalies(
         )
 
 
+async def execute_poll_cycle(
+    *,
+    config,
+    http_client,
+    minion_sem,
+    salt,
+    dependency_manager,
+    dependency_correlator,
+    correlation_cfg,
+    incident_store,
+    investigation_queue,
+    observability,
+    dry_run,
+    timeout_config,
+):
+    """Run one bounded detection/reconciliation cycle."""
+
+    async def detect_one(minion):
+        try:
+            return await asyncio.wait_for(
+                detect_minion(
+                    minion,
+                    http_client,
+                    config,
+                    minion_sem,
+                    salt,
+                    dependency_manager,
+                    salt.logged_in,
+                    timeout_config.get("prometheus_operation_seconds", 30),
+                ),
+                timeout=max(0.001, float(
+                    timeout_config.get("minion_seconds", 90)
+                )),
+            )
+        except TimeoutError:
+            observability.record_timeout("minion")
+            logger.error(
+                "Minion %s exceeded its detection deadline",
+                minion.get("id", "<unknown>"),
+            )
+            return None
+
+    raw_snapshots = await asyncio.gather(*(
+        detect_one(minion) for minion in config["minions"]
+    ))
+    successful_minions = sum(
+        1
+        for snapshot in raw_snapshots
+        if snapshot is not None and snapshot.get("complete", True)
+    )
+    snapshots = [snapshot for snapshot in raw_snapshots if snapshot]
+
+    cycle_anomalies = [
+        anomaly
+        for snapshot in snapshots
+        for anomaly in snapshot["anomalies"]
+    ]
+    cycle_anomalies = dependency_correlator.correlate(
+        cycle_anomalies,
+        correlation_cfg.get("postgres_apache", []),
+    )
+    observability.record_anomaly_observations(cycle_anomalies)
+    if dependency_correlator.last_held_count:
+        logger.info(
+            "Holding %d dependency-correlation candidate(s) for up to %.0fs "
+            "to absorb scrape skew.",
+            dependency_correlator.last_held_count,
+            dependency_correlator.grace_seconds,
+        )
+
+    await asyncio.gather(*(
+        process_minion_anomalies(
+            snapshot,
+            cycle_anomalies,
+            http_client,
+            config,
+            dry_run,
+            incident_store,
+            investigation_queue,
+            observability,
+            dependency_manager,
+            timeout_config,
+        )
+        for snapshot in snapshots
+    ))
+    observability.record_incident_counts(incident_store.count_by_status())
+    return successful_minions
+
+
 async def run(dry_run=False):
     """Main polling loop that executes all 4 steps each iteration:
     1. INGEST  -- query Prometheus for metrics
@@ -558,11 +761,27 @@ async def run(dry_run=False):
     max_llm_calls = concurrency_cfg.get("max_llm_calls", 5)
     queue_cfg = config.get("investigation_queue", {})
     max_job_age_seconds = queue_cfg.get("max_job_age_seconds", 300)
+    timeout_config = config.get("timeouts", {})
     observability_cfg = config.get("observability", {})
     observability = AgentObservability(
         readiness_max_age_seconds=observability_cfg.get(
             "readiness_max_age_seconds", max(60, interval * 3)
-        )
+        ),
+        required_dependencies={"salt", "prometheus"},
+    )
+    resilience_cfg = config.get("resilience", {})
+    dependency_manager = DependencyManager(
+        ["salt", "prometheus", "llm", "alertmanager"],
+        failure_threshold=resilience_cfg.get("failure_threshold", 3),
+        recovery_timeout_seconds=resilience_cfg.get(
+            "recovery_timeout_seconds", 30
+        ),
+        observer=observability.record_dependency,
+    )
+    salt_backoff = ExponentialBackoff(
+        initial_seconds=resilience_cfg.get("initial_backoff_seconds", 1),
+        maximum_seconds=resilience_cfg.get("maximum_backoff_seconds", 60),
+        jitter_ratio=resilience_cfg.get("jitter_ratio", 0.2),
     )
     observability_server = None
     if observability_cfg.get("enabled", True):
@@ -613,12 +832,55 @@ async def run(dry_run=False):
         logger.info("DRY RUN mode: alerts will be printed, not sent.")
 
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
-    salt = SaltAPIClient(config)
+    salt = SaltAPIClient(config, dependency_manager=dependency_manager)
     set_salt_client(salt)
+    salt_recovery_task = None
+    initial_salt_attempt = asyncio.Event()
+
+    async def wait_or_stop(seconds):
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=max(0.01, seconds))
+        except TimeoutError:
+            pass
+
+    async def maintain_salt_session():
+        failures = 0
+        while not stop.is_set():
+            if salt.logged_in:
+                await wait_or_stop(1)
+                continue
+            try:
+                await dependency_manager.execute(
+                    "salt",
+                    salt.start,
+                    timeout_seconds=resilience_cfg.get(
+                        "salt_login_timeout_seconds", 20
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                initial_salt_attempt.set()
+                delay = salt_backoff.delay(failures)
+                logger.warning(
+                    "Salt API unavailable; degraded monitoring continues "
+                    "and login retries in %.1fs: %s",
+                    delay,
+                    exc,
+                )
+                await wait_or_stop(delay)
+            else:
+                failures = 0
+                initial_salt_attempt.set()
+                logger.info("Salt API session is available.")
     try:
         if observability_server is not None:
             await observability_server.start()
-        await salt.start()
+        salt_recovery_task = asyncio.create_task(
+            maintain_salt_session(), name="salt-session-maintainer"
+        )
+        await initial_salt_attempt.wait()
         await investigation_queue.start(
             lambda work: process_firing_investigation(
                 work,
@@ -629,60 +891,46 @@ async def run(dry_run=False):
                 incident_store,
                 max_job_age_seconds,
                 observability,
+                dependency_manager,
+                timeout_config,
             )
         )
         while not stop.is_set():
             poll_started = time.monotonic()
-            snapshots = await asyncio.gather(*(
-                detect_minion(
-                    minion,
-                    http_client,
-                    config,
-                    minion_sem,
-                    salt,
+            successful_minions = 0
+            try:
+                successful_minions = await asyncio.wait_for(
+                    execute_poll_cycle(
+                        config=config,
+                        http_client=http_client,
+                        minion_sem=minion_sem,
+                        salt=salt,
+                        dependency_manager=dependency_manager,
+                        dependency_correlator=dependency_correlator,
+                        correlation_cfg=correlation_cfg,
+                        incident_store=incident_store,
+                        investigation_queue=investigation_queue,
+                        observability=observability,
+                        dry_run=dry_run,
+                        timeout_config=timeout_config,
+                    ),
+                    timeout=max(0.001, float(
+                        timeout_config.get("poll_cycle_seconds", 180)
+                    )),
                 )
-                for minion in config["minions"]
-            ))
-            successful_minions = sum(
-                1 for snapshot in snapshots if snapshot is not None
-            )
-            snapshots = [snapshot for snapshot in snapshots if snapshot]
-
-            cycle_anomalies = [
-                anomaly
-                for snapshot in snapshots
-                for anomaly in snapshot["anomalies"]
-            ]
-            cycle_anomalies = dependency_correlator.correlate(
-                cycle_anomalies,
-                correlation_cfg.get("postgres_apache", []),
-            )
-            observability.record_anomaly_observations(cycle_anomalies)
-            if dependency_correlator.last_held_count:
-                logger.info(
-                    "Holding %d dependency-correlation candidate(s) for "
-                    "up to %.0fs to absorb scrape skew.",
-                    dependency_correlator.last_held_count,
-                    dependency_correlator.grace_seconds,
+            except TimeoutError:
+                observability.record_timeout("poll_cycle")
+                logger.error(
+                    "Polling cycle exceeded its %.1fs deadline; unfinished "
+                    "minion work was cancelled.",
+                    float(timeout_config.get("poll_cycle_seconds", 180)),
                 )
-
-            await asyncio.gather(*(
-                process_minion_anomalies(
-                    snapshot,
-                    cycle_anomalies,
-                    http_client,
-                    config,
-                    dry_run,
-                    incident_store,
-                    investigation_queue,
-                    observability,
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Polling cycle failed unexpectedly; the agent will retry."
                 )
-                for snapshot in snapshots
-            ))
-
-            observability.record_incident_counts(
-                incident_store.count_by_status()
-            )
             poll_outcome = observability.record_poll(
                 duration_seconds=time.monotonic() - poll_started,
                 total_minions=len(config["minions"]),
@@ -709,9 +957,15 @@ async def run(dry_run=False):
             # Sleep for the interval, but wake promptly if asked to stop.
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # interval elapsed normally; loop again
     finally:
+        stop.set()
+        if salt_recovery_task is not None:
+            salt_recovery_task.cancel()
+            await asyncio.gather(
+                salt_recovery_task, return_exceptions=True
+            )
         observability.mark_stopping()
         if observability_server is not None:
             await observability_server.close()

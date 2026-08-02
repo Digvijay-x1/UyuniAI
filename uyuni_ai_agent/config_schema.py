@@ -176,6 +176,47 @@ class ObservabilitySettings(_StrictModel):
         return value
 
 
+class ResilienceSettings(_StrictModel):
+    failure_threshold: int = Field(default=3, ge=1)
+    recovery_timeout_seconds: float = Field(default=30, gt=0)
+    initial_backoff_seconds: float = Field(default=1, gt=0)
+    maximum_backoff_seconds: float = Field(default=60, gt=0)
+    jitter_ratio: float = Field(default=0.2, ge=0, le=1)
+    salt_login_timeout_seconds: float = Field(default=20, gt=0)
+
+    @model_validator(mode="after")
+    def validate_backoff_bounds(self):
+        if self.maximum_backoff_seconds < self.initial_backoff_seconds:
+            raise ValueError(
+                "maximum_backoff_seconds must be >= initial_backoff_seconds"
+            )
+        return self
+
+
+class TimeoutSettings(_StrictModel):
+    salt_operation_seconds: float = Field(default=70, gt=0)
+    prometheus_operation_seconds: float = Field(default=30, gt=0)
+    minion_seconds: float = Field(default=90, gt=0)
+    poll_cycle_seconds: float = Field(default=180, gt=0)
+    llm_seconds: float = Field(default=240, gt=0)
+    investigation_seconds: float = Field(default=300, gt=0)
+    alertmanager_seconds: float = Field(default=30, gt=0)
+
+    @model_validator(mode="after")
+    def validate_nested_budgets(self):
+        if self.poll_cycle_seconds < self.minion_seconds:
+            raise ValueError("poll_cycle_seconds must be >= minion_seconds")
+        if self.investigation_seconds < self.llm_seconds:
+            raise ValueError("investigation_seconds must be >= llm_seconds")
+        return self
+
+
+class QualityGateSettings(_StrictModel):
+    max_evidence_age_seconds: float = Field(default=300, gt=0)
+    minimum_supporting_records: int = Field(default=1, ge=1, le=10)
+    deterministic_analysis_enabled: bool = True
+
+
 class ConcurrencySettings(_StrictModel):
     max_minions: int = Field(gt=0)
     max_salt_calls: int = Field(gt=0)
@@ -219,6 +260,11 @@ class Settings(_StrictModel):
     )
     observability: ObservabilitySettings = Field(
         default_factory=ObservabilitySettings
+    )
+    resilience: ResilienceSettings = Field(default_factory=ResilienceSettings)
+    timeouts: TimeoutSettings = Field(default_factory=TimeoutSettings)
+    quality_gates: QualityGateSettings = Field(
+        default_factory=QualityGateSettings
     )
     concurrency: ConcurrencySettings
 

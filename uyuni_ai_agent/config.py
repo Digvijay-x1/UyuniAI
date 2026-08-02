@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import logging
+import os
 
 import yaml
 
@@ -25,6 +25,12 @@ except ImportError:  # python-dotenv not installed -- fall back to real env only
     load_dotenv = None
 
 logger = logging.getLogger(__name__)
+
+_RUNTIME_ENDPOINT_OVERRIDES = {
+    "PROMETHEUS_URL": ("prometheus", "url"),
+    "ALERTMANAGER_URL": ("alertmanager", "url"),
+    "SALT_API_URL": ("salt_api", "url"),
+}
 
 # Project root (parent of the uyuni_ai_agent package).
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,12 +70,22 @@ def _configure_langsmith():
         logger.debug("LangSmith tracing disabled.")
 
 
+def _apply_runtime_overrides(config, environ=None):
+    """Apply explicit, non-secret endpoint overrides for immutable images."""
+    environment = os.environ if environ is None else environ
+    for variable, (section, key) in _RUNTIME_ENDPOINT_OVERRIDES.items():
+        value = environment.get(variable, "").strip()
+        if value:
+            config.setdefault(section, {})[key] = value
+    return config
+
+
 def load_config():
     """Load and validate settings, overlaying secrets from the environment."""
     config_path = os.path.join(_PROJECT_ROOT, "config", "settings.yaml")
     logger.debug("loading config from: %s", config_path)
     logger.debug("file exists: %s", os.path.exists(config_path))
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     if not isinstance(config, dict):
         raise ValueError("config/settings.yaml must contain a YAML mapping")
@@ -84,6 +100,8 @@ def load_config():
     salt_pw = os.environ.get("SALT_API_PASSWORD", "")
     if salt_pw:
         config.setdefault("salt_api", {})["password"] = salt_pw
+
+    _apply_runtime_overrides(config)
 
     config = validate_config(config)
 

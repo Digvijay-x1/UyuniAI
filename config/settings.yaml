@@ -115,15 +115,42 @@ investigation_queue:
   # Drain briefly on shutdown; unfinished incidents retry after restart.
   shutdown_grace_seconds: 30
 
-# Agent health and low-cardinality self-metrics. Loopback binding avoids a new
-# externally reachable service; deliberately expose it only when a protected
-# Prometheus scrape path has been configured.
+# Agent health and low-cardinality self-metrics. The agent shares the Uyuni
+# server container's network namespace, but this port is not host-published.
+# Expose it only through a source-restricted proxy from the monitoring VM.
 observability:
   enabled: true
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 9898
   # Readiness fails when no minion poll has succeeded within this window.
   readiness_max_age_seconds: 180
+
+# Temporary dependency failures put the agent into degraded mode rather than
+# terminating the process. Circuit breakers and jitter prevent retry storms.
+resilience:
+  failure_threshold: 3
+  recovery_timeout_seconds: 30
+  initial_backoff_seconds: 1
+  maximum_backoff_seconds: 60
+  jitter_ratio: 0.2
+  salt_login_timeout_seconds: 20
+
+# Nested deadlines prevent one dependency or investigation from monopolizing
+# a worker. Timed-out incidents remain unacknowledged and retry on a later poll.
+timeouts:
+  salt_operation_seconds: 70
+  prometheus_operation_seconds: 30
+  minion_seconds: 90
+  poll_cycle_seconds: 180
+  llm_seconds: 240
+  investigation_seconds: 300
+  alertmanager_seconds: 30
+
+quality_gates:
+  max_evidence_age_seconds: 300
+  minimum_supporting_records: 1
+  # Fixed evidence patterns bypass the LLM only when they directly prove RCA.
+  deterministic_analysis_enabled: true
 
 concurrency:
   max_minions: 8       # minions processed in parallel per cycle

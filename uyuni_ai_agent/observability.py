@@ -11,7 +11,8 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -24,7 +25,6 @@ from prometheus_client import (
     ProcessCollector,
     generate_latest,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,18 @@ _QUEUE_COUNTER_FIELDS = (
 )
 _HTTP_READ_TIMEOUT_SECONDS = 2.0
 _HTTP_MAX_HEADER_BYTES = 8192
+_DEPENDENCIES = ("salt", "prometheus", "llm", "alertmanager")
+_DEPENDENCY_OUTCOMES = ("success", "error", "timeout", "circuit_open")
+_CIRCUIT_STATES = ("closed", "open", "half_open")
+_TIMEOUT_SCOPES = (
+    "salt",
+    "prometheus",
+    "minion",
+    "poll_cycle",
+    "llm",
+    "investigation",
+    "alertmanager",
+)
 
 
 class AgentObservability:
@@ -50,12 +62,20 @@ class AgentObservability:
         readiness_max_age_seconds: float,
         clock: Callable[[], float] = time.time,
         include_runtime_collectors: bool = True,
+        required_dependencies: set[str] | None = None,
     ):
         if readiness_max_age_seconds <= 0:
             raise ValueError("readiness_max_age_seconds must be greater than 0")
         self.readiness_max_age_seconds = float(readiness_max_age_seconds)
         self._clock = clock
         self._last_successful_poll_at: float | None = None
+        self._required_dependencies = frozenset(required_dependencies or ())
+        unknown = self._required_dependencies - set(_DEPENDENCIES)
+        if unknown:
+            raise ValueError(f"unknown required dependencies: {sorted(unknown)}")
+        self._dependency_available = {
+            dependency: False for dependency in _DEPENDENCIES
+        }
         self._last_queue_totals = {
             field: 0 for field in _QUEUE_COUNTER_FIELDS
         }
@@ -158,6 +178,43 @@ class AgentObservability:
             buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
             registry=self.registry,
         )
+        self.dependency_up = Gauge(
+            "uyuni_ai_agent_dependency_up",
+            "Whether an external dependency's last operation succeeded.",
+            ("dependency",),
+            registry=self.registry,
+        )
+        self.dependency_operations = Counter(
+            "uyuni_ai_agent_dependency_operations_total",
+            "Dependency operations by bounded outcome.",
+            ("dependency", "outcome"),
+            registry=self.registry,
+        )
+        self.dependency_duration = Histogram(
+            "uyuni_ai_agent_dependency_operation_duration_seconds",
+            "Dependency operation duration.",
+            ("dependency",),
+            buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+            registry=self.registry,
+        )
+        self.dependency_circuit = Gauge(
+            "uyuni_ai_agent_dependency_circuit_state",
+            "One-hot dependency circuit state.",
+            ("dependency", "state"),
+            registry=self.registry,
+        )
+        self.dependency_failures = Gauge(
+            "uyuni_ai_agent_dependency_consecutive_failures",
+            "Consecutive failures recorded by the dependency circuit.",
+            ("dependency",),
+            registry=self.registry,
+        )
+        self.timeouts = Counter(
+            "uyuni_ai_agent_timeouts_total",
+            "Runtime timeouts by bounded operation scope.",
+            ("scope",),
+            registry=self.registry,
+        )
 
         now = self._clock()
         self.up.set(1)
@@ -172,13 +229,33 @@ class AgentObservability:
             self.queue_events.labels(event=event).inc(0)
         for status in ("active", "resolved"):
             self.incidents.labels(status=status).set(0)
+        for dependency in _DEPENDENCIES:
+            self.dependency_up.labels(dependency=dependency).set(0)
+            self.dependency_failures.labels(dependency=dependency).set(0)
+            for outcome in _DEPENDENCY_OUTCOMES:
+                self.dependency_operations.labels(
+                    dependency=dependency, outcome=outcome
+                ).inc(0)
+            for state in _CIRCUIT_STATES:
+                self.dependency_circuit.labels(
+                    dependency=dependency, state=state
+                ).set(1 if state == "closed" else 0)
+        for scope in _TIMEOUT_SCOPES:
+            self.timeouts.labels(scope=scope).inc(0)
 
     @property
     def ready(self) -> bool:
         if self._last_successful_poll_at is None:
             return False
         age = self._clock() - self._last_successful_poll_at
-        return 0 <= age <= self.readiness_max_age_seconds
+        dependencies_ready = all(
+            self._dependency_available[name]
+            for name in self._required_dependencies
+        )
+        return (
+            0 <= age <= self.readiness_max_age_seconds
+            and dependencies_ready
+        )
 
     def mark_stopping(self) -> None:
         self.ready_metric.set(0)
@@ -289,6 +366,49 @@ class AgentObservability:
             state=normalized_state, outcome="dry_run"
         ).inc()
 
+    def record_dependency(
+        self,
+        dependency: str,
+        outcome: str,
+        duration_seconds: float,
+        circuit_snapshot: Any,
+    ) -> None:
+        if dependency not in _DEPENDENCIES:
+            raise ValueError(f"unknown dependency {dependency!r}")
+        normalized_outcome = str(outcome).lower()
+        if normalized_outcome not in _DEPENDENCY_OUTCOMES:
+            normalized_outcome = "error"
+        state_value = getattr(circuit_snapshot, "state", "open")
+        state = str(getattr(state_value, "value", state_value)).lower()
+        if state not in _CIRCUIT_STATES:
+            state = "open"
+        available = normalized_outcome == "success"
+        self._dependency_available[dependency] = available
+        self.dependency_up.labels(dependency=dependency).set(
+            1 if available else 0
+        )
+        self.dependency_operations.labels(
+            dependency=dependency, outcome=normalized_outcome
+        ).inc()
+        self.dependency_duration.labels(dependency=dependency).observe(
+            max(0.0, float(duration_seconds))
+        )
+        failures = max(
+            0, int(getattr(circuit_snapshot, "consecutive_failures", 0))
+        )
+        self.dependency_failures.labels(dependency=dependency).set(failures)
+        for candidate in _CIRCUIT_STATES:
+            self.dependency_circuit.labels(
+                dependency=dependency, state=candidate
+            ).set(1 if candidate == state else 0)
+        self._refresh_readiness()
+
+    def record_timeout(self, scope: str) -> None:
+        normalized = str(scope).lower()
+        if normalized not in _TIMEOUT_SCOPES:
+            raise ValueError(f"unknown timeout scope {scope!r}")
+        self.timeouts.labels(scope=normalized).inc()
+
     def render_metrics(self) -> bytes:
         self._refresh_readiness()
         return generate_latest(self.registry)
@@ -381,11 +501,7 @@ class ObservabilityServer:
                 content_type=content_type,
                 head_only=method == "HEAD",
             )
-        except (
-            asyncio.IncompleteReadError,
-            asyncio.LimitOverrunError,
-            asyncio.TimeoutError,
-        ):
+        except (TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             await self._respond(writer, 400, b"bad request\n")
         except (ConnectionError, BrokenPipeError):
             pass
