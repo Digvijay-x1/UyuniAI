@@ -79,6 +79,23 @@ def test_ignored_unit_globs_are_applied():
 
 
 @pytest.mark.parametrize(
+    "output",
+    [False, None, "Salt API call failed: minion returned no cmd.run result"],
+)
+def test_failed_service_inspection_is_not_reported_as_healthy(output):
+    anomalies = asyncio.run(check_failed_services(
+        "client",
+        FakeSaltClient(output),
+        {"service_monitoring": {"enabled": True, "ignored_units": []}},
+    ))
+
+    assert len(anomalies) == 1
+    assert anomalies[0].metric_name == "telemetry_unavailable"
+    assert anomalies[0].context["source"] == "salt"
+    assert anomalies[0].resource == "telemetry:salt_inspection:client"
+
+
+@pytest.mark.parametrize(
     "unit",
     [
         "my-web.service; reboot",

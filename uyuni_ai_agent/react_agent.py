@@ -20,7 +20,17 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage
 
 from uyuni_ai_agent.llm_provider import get_llm
-from uyuni_ai_agent.models import RootCauseAnalysis
+from uyuni_ai_agent.models import (
+    AnalysisConclusion,
+    RootCauseAnalysis,
+    Urgency,
+)
+from uyuni_ai_agent.evidence import (
+    EvidenceLedger,
+    EvidenceStatus,
+    evidence_status_for,
+    ground_analysis,
+)
 from uyuni_ai_agent import salt_api
 from uyuni_ai_agent.disk_inspection import parse_service_unit_references
 from uyuni_ai_agent.tools.process_tools import (
@@ -260,15 +270,90 @@ def _bounded_text(value, limit=8000):
     return text[:limit] + "\n...[truncated]"
 
 
+def _ledger_for_anomaly(anomaly):
+    ledger = EvidenceLedger(anomaly.minion_id)
+    ledger.add(
+        source="detector",
+        check=anomaly.metric_name,
+        status=EvidenceStatus.OK,
+        summary=anomaly.description,
+        details={
+            "value": anomaly.current_value,
+            "threshold": anomaly.threshold,
+            "severity": anomaly.severity.value,
+            "service": anomaly.service_name,
+            "resource": anomaly.resource,
+            "context": anomaly.context,
+        },
+        detail_limit=8_000,
+    )
+    if anomaly.metric_name == "telemetry_unavailable":
+        evidence_source = anomaly.context.get("source", "prometheus")
+        for observation in anomaly.context.get("observations", []):
+            raw_status = observation.get("status", "error")
+            try:
+                status = EvidenceStatus(raw_status)
+            except ValueError:
+                status = EvidenceStatus.ERROR
+            ledger.add(
+                source=evidence_source,
+                target=anomaly.context.get("target", anomaly.minion_id),
+                check=observation.get("name", "unknown_metric"),
+                status=status,
+                summary=(
+                    f"{observation.get('name', 'metric')} telemetry is "
+                    f"{status.value}"
+                ),
+                details=observation,
+                detail_limit=4_000,
+            )
+    return ledger
+
+
+def _add_salt_evidence(
+    ledger,
+    *,
+    check,
+    summary,
+    value,
+    target=None,
+    detail_limit=12_000,
+):
+    return ledger.add(
+        source="salt",
+        target=target,
+        check=check,
+        status=evidence_status_for(value),
+        summary=summary,
+        details=value,
+        detail_limit=detail_limit,
+    )
+
+
+def _salt_unavailable(ledger, summary):
+    ledger.add(
+        source="salt",
+        check="salt_api",
+        status=EvidenceStatus.ERROR,
+        summary=summary,
+        details="The shared Salt API client was not initialized.",
+    )
+    return ledger
+
+
 async def collect_required_disk_evidence(anomaly):
     """Collect the minimum evidence required for a causal disk RCA.
 
     This path is deterministic: the LLM may call additional tools, but cannot
     skip filesystem, largest-file, and candidate-service inspection.
     """
+    ledger = _ledger_for_anomaly(anomaly)
     client = salt_api.salt_client
     if client is None:
-        return "Salt client is unavailable; required disk evidence not collected."
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; required disk evidence was not collected",
+        )
 
     minion_id = anomaly.minion_id
     mountpoint = anomaly.context.get("mountpoint", anomaly.resource or "/")
@@ -286,7 +371,28 @@ async def collect_required_disk_evidence(anomaly):
             candidates.append(unit)
     candidates = candidates[:3]
 
-    service_evidence = []
+    _add_salt_evidence(
+        ledger,
+        check="disk_usage",
+        summary=f"Disk usage snapshot for {mountpoint}",
+        value=disk_usage,
+        detail_limit=10_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        check="largest_files",
+        summary=f"Largest files on filesystem containing {mountpoint}",
+        value=largest_files,
+        detail_limit=8_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        check="service_references",
+        summary=f"Systemd units referencing {mountpoint}",
+        value=references,
+        detail_limit=4_000,
+    )
+
     if candidates:
         inspections = await asyncio.gather(*(
             asyncio.gather(
@@ -296,30 +402,38 @@ async def collect_required_disk_evidence(anomaly):
             for service in candidates
         ))
         for service, (details, logs) in zip(candidates, inspections):
-            service_evidence.append(
-                f"SERVICE {service}\n"
-                f"DETAILS:\n{_bounded_text(details, 8000)}\n"
-                f"JOURNAL:\n{_bounded_text(logs, 8000)}"
+            _add_salt_evidence(
+                ledger,
+                check=f"service_details:{service}",
+                summary=f"Runtime properties for candidate service {service}",
+                value=details,
+                detail_limit=8_000,
+            )
+            _add_salt_evidence(
+                ledger,
+                check=f"service_logs:{service}",
+                summary=f"Recent journal for candidate service {service}",
+                value=logs,
+                detail_limit=8_000,
             )
     else:
-        service_evidence.append("No candidate systemd service was discovered.")
-
-    return (
-        f"AFFECTED MOUNTPOINT: {mountpoint}\n"
-        f"DISK USAGE:\n{_bounded_text(disk_usage, 10000)}\n\n"
-        f"LARGEST FILES:\n{_bounded_text(largest_files, 8000)}\n\n"
-        f"UNIT FILE REFERENCES:\n{_bounded_text(references, 4000)}\n\n"
-        + "\n\n".join(service_evidence)
-    )
+        ledger.add(
+            source="detector",
+            check="candidate_service_discovery",
+            status=EvidenceStatus.MISSING,
+            summary="No candidate systemd service was discovered",
+        )
+    return ledger
 
 
 async def collect_required_postgres_lock_evidence(anomaly):
     """Collect availability and lock-chain evidence before LLM reasoning."""
+    ledger = _ledger_for_anomaly(anomaly)
     client = salt_api.salt_client
     if client is None:
-        return (
-            "Salt client is unavailable; required PostgreSQL evidence "
-            "was not collected."
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; PostgreSQL evidence was not collected",
         )
 
     health, lock_pairs, apache_snapshot = await asyncio.gather(
@@ -327,26 +441,38 @@ async def collect_required_postgres_lock_evidence(anomaly):
         client.postgres_blocking_activity(anomaly.minion_id),
         client.apache_overload_snapshot(anomaly.minion_id),
     )
-    detector_pairs = anomaly.context.get("blocked_pairs", [])
-    return (
-        "POSTGRESQL AVAILABILITY:\n"
-        f"{_bounded_text(health, 4000)}\n\n"
-        "CURRENT BLOCKED/BLOCKER PAIRS:\n"
-        f"{_bounded_text(lock_pairs, 12000)}\n\n"
-        "CURRENT APACHE/DEPENDENCY SNAPSHOT:\n"
-        f"{_bounded_text(apache_snapshot, 18000)}\n\n"
-        "DETECTOR SNAPSHOT:\n"
-        f"{_bounded_text(detector_pairs, 12000)}"
+    _add_salt_evidence(
+        ledger,
+        check="postgres_health",
+        summary="PostgreSQL availability and server identity",
+        value=health,
+        detail_limit=4_000,
     )
+    _add_salt_evidence(
+        ledger,
+        check="postgres_blocking_activity",
+        summary="Current PostgreSQL blocked and blocker sessions",
+        value=lock_pairs,
+        detail_limit=12_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        check="apache_dependency_snapshot",
+        summary="Current Apache and dependency connection snapshot",
+        value=apache_snapshot,
+        detail_limit=18_000,
+    )
+    return ledger
 
 
 async def collect_required_apache_evidence(anomaly):
     """Collect one coherent traffic/backend snapshot before Apache RCA."""
+    ledger = _ledger_for_anomaly(anomaly)
     client = salt_api.salt_client
     if client is None:
-        return (
-            "Salt client is unavailable; required Apache evidence was not "
-            "collected."
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; Apache evidence was not collected",
         )
     apache_minion_id = anomaly.context.get(
         "apache_minion_id", anomaly.minion_id
@@ -362,29 +488,49 @@ async def collect_required_apache_evidence(anomaly):
             client.postgres_connection_activity(postgres_minion_id),
         )
     )
-    return (
-        "PROMETHEUS DETECTOR SNAPSHOT:\n"
-        f"{_bounded_text(anomaly.context, 5000)}\n\n"
-        f"APACHE/APPLICATION MINION: {apache_minion_id}\n"
-        "LIVE APACHE, TRAFFIC, CONNECTION, PROCESS, AND CONFIG SNAPSHOT:\n"
-        f"{_bounded_text(snapshot, 24000)}\n\n"
-        f"POSTGRESQL MINION: {postgres_minion_id}\n"
-        "POSTGRESQL AVAILABILITY:\n"
-        f"{_bounded_text(postgres_health, 4000)}\n\n"
-        "POSTGRESQL BLOCKED/BLOCKER PAIRS:\n"
-        f"{_bounded_text(postgres_locks, 14000)}\n\n"
-        "POSTGRESQL CONNECTION CAPACITY/OWNERSHIP:\n"
-        f"{_bounded_text(postgres_connections, 12000)}"
+    _add_salt_evidence(
+        ledger,
+        target=apache_minion_id,
+        check="apache_overload_snapshot",
+        summary="Apache traffic, worker, connection, process, and config snapshot",
+        value=snapshot,
+        detail_limit=24_000,
     )
+    _add_salt_evidence(
+        ledger,
+        target=postgres_minion_id,
+        check="postgres_health",
+        summary="Downstream PostgreSQL availability",
+        value=postgres_health,
+        detail_limit=4_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        target=postgres_minion_id,
+        check="postgres_blocking_activity",
+        summary="Downstream PostgreSQL blocked and blocker sessions",
+        value=postgres_locks,
+        detail_limit=14_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        target=postgres_minion_id,
+        check="postgres_connection_activity",
+        summary="Downstream PostgreSQL connection capacity and ownership",
+        value=postgres_connections,
+        detail_limit=12_000,
+    )
+    return ledger
 
 
 async def collect_required_postgres_connection_evidence(anomaly):
     """Collect availability, capacity ownership, and lock evidence."""
+    ledger = _ledger_for_anomaly(anomaly)
     client = salt_api.salt_client
     if client is None:
-        return (
-            "Salt client is unavailable; required PostgreSQL connection "
-            "evidence was not collected."
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; PostgreSQL connection evidence was not collected",
         )
 
     health, connections, lock_pairs = await asyncio.gather(
@@ -392,51 +538,108 @@ async def collect_required_postgres_connection_evidence(anomaly):
         client.postgres_connection_activity(anomaly.minion_id),
         client.postgres_blocking_activity(anomaly.minion_id),
     )
-    return (
-        "POSTGRESQL AVAILABILITY:\n"
-        f"{_bounded_text(health, 4000)}\n\n"
-        "CONNECTION CAPACITY AND OWNERSHIP:\n"
-        f"{_bounded_text(connections, 16000)}\n\n"
-        "CURRENT BLOCKED/BLOCKER PAIRS:\n"
-        f"{_bounded_text(lock_pairs, 10000)}\n\n"
-        "PROMETHEUS DETECTOR SNAPSHOT:\n"
-        f"{_bounded_text(anomaly.context, 4000)}"
+    _add_salt_evidence(
+        ledger,
+        check="postgres_health",
+        summary="PostgreSQL availability and server identity",
+        value=health,
+        detail_limit=4_000,
     )
+    _add_salt_evidence(
+        ledger,
+        check="postgres_connection_activity",
+        summary="PostgreSQL connection capacity and ownership",
+        value=connections,
+        detail_limit=16_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        check="postgres_blocking_activity",
+        summary="Current PostgreSQL blocked and blocker sessions",
+        value=lock_pairs,
+        detail_limit=10_000,
+    )
+    return ledger
 
 
 async def collect_required_memory_evidence(anomaly):
     """Collect a live, fixed-command snapshot before memory RCA reasoning."""
+    ledger = _ledger_for_anomaly(anomaly)
     client = salt_api.salt_client
     if client is None:
-        return (
-            "Salt client is unavailable; required memory-pressure evidence "
-            "was not collected."
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; memory-pressure evidence was not collected",
         )
 
     snapshot = await client.memory_pressure_snapshot(anomaly.minion_id)
-    return (
-        "PROMETHEUS DETECTOR SNAPSHOT:\n"
-        f"{_bounded_text(anomaly.context, 8000)}\n\n"
-        "LIVE HOST SNAPSHOT:\n"
-        f"{_bounded_text(snapshot, 16000)}"
+    _add_salt_evidence(
+        ledger,
+        check="memory_pressure_snapshot",
+        summary="Live memory, swap, CPU, PSI, and top-RSS snapshot",
+        value=snapshot,
+        detail_limit=16_000,
     )
+    return ledger
 
 
 async def collect_required_cpu_evidence(anomaly):
     """Collect a live fixed-command snapshot before CPU RCA reasoning."""
+    ledger = _ledger_for_anomaly(anomaly)
     client = salt_api.salt_client
     if client is None:
-        return (
-            "Salt client is unavailable; required CPU evidence was not "
-            "collected."
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; CPU evidence was not collected",
         )
     snapshot = await client.cpu_pressure_snapshot(anomaly.minion_id)
-    return (
-        "PROMETHEUS DETECTOR SNAPSHOT:\n"
-        f"{_bounded_text(anomaly.context, 8000)}\n\n"
-        "LIVE HOST SNAPSHOT:\n"
-        f"{_bounded_text(snapshot, 16000)}"
+    _add_salt_evidence(
+        ledger,
+        check="cpu_pressure_snapshot",
+        summary="Live load, CPU, PSI, and top-CPU process snapshot",
+        value=snapshot,
+        detail_limit=16_000,
     )
+    return ledger
+
+
+async def collect_required_service_evidence(anomaly):
+    """Collect service state, logs, and listeners before service-down RCA."""
+    ledger = _ledger_for_anomaly(anomaly)
+    client = salt_api.salt_client
+    if client is None:
+        return _salt_unavailable(
+            ledger,
+            "Salt client is unavailable; service evidence was not collected",
+        )
+    service = anomaly.service_name or "unknown.service"
+    details, logs, listeners = await asyncio.gather(
+        client.service_details(anomaly.minion_id, service),
+        client.service_logs(anomaly.minion_id, service, lines=50),
+        client.run_command(anomaly.minion_id, "ss -ltnp"),
+    )
+    _add_salt_evidence(
+        ledger,
+        check=f"service_details:{service}",
+        summary=f"Runtime properties for failed service {service}",
+        value=details,
+        detail_limit=8_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        check=f"service_logs:{service}",
+        summary=f"Recent journal for failed service {service}",
+        value=logs,
+        detail_limit=10_000,
+    )
+    _add_salt_evidence(
+        ledger,
+        check="listening_tcp_ports",
+        summary="Processes listening on TCP ports",
+        value=listeners,
+        detail_limit=8_000,
+    )
+    return ledger
 
 
 _REQUIRED_EVIDENCE_COLLECTORS = {
@@ -449,6 +652,7 @@ _REQUIRED_EVIDENCE_COLLECTORS = {
     "disk": collect_required_disk_evidence,
     "postgres_blocked_transaction": collect_required_postgres_lock_evidence,
     "postgres_connections": collect_required_postgres_connection_evidence,
+    "service_down": collect_required_service_evidence,
 }
 
 
@@ -456,7 +660,7 @@ async def collect_required_evidence(anomaly):
     """Collect deterministic evidence for anomaly types that require it."""
     collector = _REQUIRED_EVIDENCE_COLLECTORS.get(anomaly.metric_name)
     if collector is None:
-        return ""
+        return _ledger_for_anomaly(anomaly)
     return await collector(anomaly)
 
 
@@ -464,11 +668,62 @@ def append_required_evidence(prompt, evidence):
     """Append one consistently formatted, bounded evidence section."""
     if not evidence:
         return prompt
+    evidence_text = (
+        evidence.to_prompt()
+        if isinstance(evidence, EvidenceLedger)
+        else str(evidence)
+    )
+    if not evidence_text:
+        return prompt
     return (
         f"{prompt}\n\n## Pre-collected mandatory evidence\n\n"
-        f"{evidence}\n\n"
-        "Use this evidence in the RCA. You may call tools for clarification."
+        f"{evidence_text}\n\n"
+        "Use this evidence in the RCA. Cite evidence IDs exactly as [E1], "
+        "and set conclusion=confirmed only when the cited records prove the "
+        "cause. You may call tools for clarification."
     )
+
+
+def _telemetry_unavailable_analysis(anomaly, ledger):
+    failed = [
+        record for record in ledger.records
+        if record.status is not EvidenceStatus.OK
+    ]
+    supporting = failed or ledger.records
+    citations = ", ".join(f"[{record.id}]" for record in supporting[:3])
+    source = anomaly.context.get("source", "prometheus")
+    if source == "salt":
+        root_cause = (
+            f"Salt cannot provide trustworthy inspection results for the "
+            f"configured minion {citations}."
+        )
+        remediation = [
+            "Check Salt minion connectivity and whether jobs return to the Uyuni server.",
+            "Restore the Salt inspection path before evaluating service or database health.",
+        ]
+    else:
+        root_cause = (
+            f"Prometheus cannot provide trustworthy telemetry for the "
+            f"configured target {citations}."
+        )
+        remediation = [
+            "Check the Prometheus target status and the exporter process.",
+            "Restore scraping, then wait for a fresh sample before evaluating system health.",
+        ]
+    analysis = RootCauseAnalysis(
+        summary=anomaly.description,
+        conclusion=AnalysisConclusion.CONFIRMED,
+        affected_component=anomaly.context.get("exporter", "telemetry"),
+        root_cause=root_cause,
+        supporting_evidence_ids=[record.id for record in supporting[:3]],
+        key_evidence=[
+            f"[{record.id}] {record.summary}" for record in supporting[:3]
+        ],
+        remediation=remediation,
+        urgency=Urgency.MEDIUM,
+        confidence=1.0,
+    )
+    return ground_analysis(analysis, ledger, allow_failed_evidence=True)
 
 
 async def investigate(anomaly, metrics, config):
@@ -489,16 +744,17 @@ async def investigate(anomaly, metrics, config):
     Returns:
         RootCauseAnalysis: the validated, structured analysis.
     """
+    required_evidence = await collect_required_evidence(anomaly)
+    if anomaly.metric_name == "telemetry_unavailable":
+        return _telemetry_unavailable_analysis(anomaly, required_evidence)
+
+    # Load system and scenario-specific prompts only for LLM investigations.
+    system_prompt = load_prompt("system_prompt.md")
+    scenario_prompt = get_prompt_for_anomaly(anomaly, metrics)
+
     # Reuse the compiled agent + LLM client (built once, cached) instead of
     # reconstructing both on every call. Only the messages vary per anomaly.
     agent = get_agent(config)
-
-    # Load system prompt
-    system_prompt = load_prompt("system_prompt.md")
-
-    # Load scenario-specific prompt
-    scenario_prompt = get_prompt_for_anomaly(anomaly, metrics)
-    required_evidence = await collect_required_evidence(anomaly)
     scenario_prompt = append_required_evidence(
         scenario_prompt,
         required_evidence,
@@ -513,10 +769,11 @@ async def investigate(anomaly, metrics, config):
     })
 
     reasoning = _extract_text(result["messages"][-1])
-    if required_evidence:
+    evidence_text = required_evidence.to_prompt()
+    if evidence_text:
         reasoning = (
             "PRE-COLLECTED MANDATORY EVIDENCE:\n"
-            f"{required_evidence}\n\n"
+            f"{evidence_text}\n\n"
             f"AGENT SYNTHESIS:\n{reasoning}"
         )
 
@@ -525,9 +782,12 @@ async def investigate(anomaly, metrics, config):
     structuring_prompt = (
         "Convert the following investigation into the required structured "
         "analysis. Use ONLY the information present in the investigation; do "
-        "not invent evidence. If a field cannot be determined, use a clearly "
-        "conservative value (e.g. affected_component='unknown', low "
-        "confidence).\n\n"
+        "not invent evidence or evidence IDs. Set conclusion='confirmed' only "
+        "when the cause is proven. A confirmed root_cause must cite one or "
+        "more supplied IDs such as [E1], supporting_evidence_ids must contain "
+        "those IDs, and every key_evidence item must start with a supplied "
+        "ID. Otherwise set conclusion='inconclusive', affected_component="
+        "'unknown', and use low confidence.\n\n"
         f"ANOMALY: {anomaly.description} "
         f"(metric={anomaly.metric_name}, value={anomaly.current_value:.1f}, "
         f"threshold={anomaly.threshold:.1f}, severity={anomaly.severity.value}, "
@@ -546,7 +806,7 @@ async def investigate(anomaly, metrics, config):
         ),
         ("human", structuring_prompt),
     ])
-    return analysis
+    return ground_analysis(analysis, required_evidence)
 
 
 def _extract_text(final_message):

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from uyuni_ai_agent.anomaly_detector import (
     AlertSeverity,
@@ -119,7 +120,7 @@ class FakeResponse:
         return {
             "data": {
                 "result": [
-                    {"metric": {}, "value": [0, str(self.value)]}
+                    {"metric": {}, "value": [time.time(), str(self.value)]}
                 ]
             }
         }

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from uyuni_ai_agent.anomaly_detector import (
     AlertSeverity,
@@ -20,7 +21,7 @@ class FakeResponse:
                             "fstype": "ext4",
                             "mountpoint": "/",
                         },
-                        "value": [0, "10.5"],
+                        "value": [time.time(), "10.5"],
                     },
                     {
                         "metric": {
@@ -28,7 +29,7 @@ class FakeResponse:
                             "fstype": "ext4",
                             "mountpoint": "/mnt/my-lab-disk",
                         },
-                        "value": [0, "91.25"],
+                        "value": [time.time(), "91.25"],
                     },
                 ]
             }
@@ -46,10 +47,12 @@ class FakeClient:
 
 def test_prometheus_filesystem_discovery_returns_all_mounts():
     client = FakeClient()
-    filesystems = asyncio.run(get_filesystem_usage_percent(
+    reading = asyncio.run(get_filesystem_usage_percent(
         "client:9100", client, "http://prometheus:9090"
     ))
+    filesystems = reading.value
 
+    assert reading.status.value == "ok"
     assert [item["mountpoint"] for item in filesystems] == [
         "/",
         "/mnt/my-lab-disk",

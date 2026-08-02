@@ -102,6 +102,12 @@ class FakeSaltClient:
         return json.dumps([lock_pair(blocked_seconds=8)])
 
 
+class FailedSaltClient:
+    async def postgres_blocking_activity(self, minion_id):
+        assert minion_id == "client"
+        return False
+
+
 def test_async_detector_uses_fixed_salt_probe():
     config = {
         "thresholds": {
@@ -120,6 +126,27 @@ def test_async_detector_uses_fixed_salt_probe():
 
     assert len(anomalies) == 1
     assert anomalies[0].severity is AlertSeverity.WARNING
+
+
+def test_failed_postgres_inspection_is_not_reported_as_healthy():
+    anomalies = asyncio.run(check_postgres_blocked_transactions(
+        "client",
+        FailedSaltClient(),
+        {
+            "thresholds": {
+                "postgres": {
+                    "blocked_transaction_seconds": {
+                        "warning": 5,
+                        "critical": 30,
+                    }
+                }
+            }
+        },
+    ))
+
+    assert len(anomalies) == 1
+    assert anomalies[0].metric_name == "telemetry_unavailable"
+    assert anomalies[0].context["source"] == "salt"
 
 
 def test_postgres_probe_is_read_only_and_bounded():

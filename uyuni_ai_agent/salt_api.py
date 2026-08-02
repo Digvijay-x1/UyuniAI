@@ -198,7 +198,13 @@ class SaltAPIClient:
     async def run_command(self, minion_id, cmd):
         """Run a shell command on a minion via cmd.run."""
         logger.debug("salt_api: cmd.run minion=%s cmd=%s", minion_id, cmd[:60])
-        return await self._safe_call(minion_id, "cmd.run", [cmd])
+        result = await self._safe_call(minion_id, "cmd.run", [cmd])
+        # Salt returns the boolean False when a minion job does not return.
+        # cmd.run itself has string output, so False/None are transport state,
+        # not valid command results.
+        if result is False or result is None:
+            return "Salt API call failed: minion returned no cmd.run result"
+        return str(result)
 
     async def disk_usage(self, minion_id):
         """Get disk usage for a minion via disk.usage."""
@@ -233,7 +239,7 @@ class SaltAPIClient:
         lines = bounded_int(lines, name="lines", minimum=1, maximum=200)
         logger.debug("salt_api: service_logs minion=%s service=%s", minion_id, service)
         cmd = f"journalctl -u {service} -n {lines} --no-pager"
-        return await self._safe_call(minion_id, "cmd.run", [cmd])
+        return await self.run_command(minion_id, cmd)
 
     async def failed_systemd_services(self, minion_id):
         """Return failed or auto-restarting services with a fixed command.
@@ -247,7 +253,7 @@ class SaltAPIClient:
             "--no-legend --no-pager --plain"
         )
         logger.debug("salt_api: failed_systemd_services minion=%s", minion_id)
-        return await self._safe_call(minion_id, "cmd.run", [cmd])
+        return await self.run_command(minion_id, cmd)
 
     async def service_details(self, minion_id, service):
         """Return bounded diagnostic properties for one systemd service."""
@@ -261,7 +267,7 @@ class SaltAPIClient:
             f"--property={properties}"
         )
         logger.debug("salt_api: service_details minion=%s service=%s", minion_id, service)
-        return await self._safe_call(minion_id, "cmd.run", [cmd])
+        return await self.run_command(minion_id, cmd)
 
     async def memory_pressure_snapshot(self, minion_id):
         """Return bounded live memory, swap, CPU, and top-RSS evidence."""

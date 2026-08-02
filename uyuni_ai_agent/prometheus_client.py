@@ -12,144 +12,396 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Prometheus queries with explicit missing, stale, and error semantics."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
 import logging
+import math
+import time
+from typing import Any
+
+from uyuni_ai_agent.evidence import EvidenceStatus
 
 logger = logging.getLogger(__name__)
 
 
-async def query_prometheus(prom_ql, client, prometheus_url):
-    """Execute an instant PromQL query and return the results."""
-    URL = f"{prometheus_url}/api/v1/query"
-    logger.debug("querying prometheus: %s query=%s", URL, prom_ql[:80])
+@dataclass(frozen=True)
+class PrometheusQueryResult:
+    """Raw Prometheus API result without stringly-typed error handling."""
 
-    params = {
-        'query': prom_ql
-    }
+    status: EvidenceStatus
+    query: str
+    source: str
+    samples: list[dict[str, Any]] = field(default_factory=list)
+    observed_at: float | None = None
+    error: str | None = None
 
-    try:
-        response = await client.get(URL, params=params, timeout=10)
-        if response.status_code == 200:
-            results = response.json()['data']['result']
-            return results
+
+@dataclass(frozen=True)
+class MetricReading:
+    """A parsed metric value and the state of the telemetry behind it."""
+
+    name: str
+    target: str
+    exporter: str
+    status: EvidenceStatus
+    value: Any = None
+    observed_at: float | None = None
+    error: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.status is EvidenceStatus.OK and self.value is not None
+
+    def as_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["status"] = self.status.value
+        return data
+
+
+def _bounded_error(value: Any, limit: int = 500) -> str:
+    rendered = str(value).strip().replace("\x00", "")
+    return rendered[:limit]
+
+
+def _latest_sample_timestamp(samples: list[dict[str, Any]]) -> float | None:
+    timestamps: list[float] = []
+    for sample in samples:
+        raw_values = sample.get("values")
+        if isinstance(raw_values, list) and raw_values:
+            raw_timestamp = raw_values[-1][0]
         else:
-            return f"Error: {response.status_code} - {response.text}"
-    except Exception as e:
-        return f"Connection Failed: {str(e)}"
+            raw_value = sample.get("value")
+            if not isinstance(raw_value, (list, tuple)) or not raw_value:
+                continue
+            raw_timestamp = raw_value[0]
+        try:
+            timestamps.append(float(raw_timestamp))
+        except (TypeError, ValueError):
+            continue
+    return max(timestamps) if timestamps else None
 
 
-async def query_prometheus_range(prom_ql, start, end, client, prometheus_url, step="1m"):
-    """Execute a range PromQL query over a time window."""
-    URL = f"{prometheus_url}/api/v1/query_range"
-
-    params = {
-        'query': prom_ql,
-        'start': start.isoformat(),
-        'end': end.isoformat(),
-        'step': step
-    }
-
+def _parse_response(
+    response: Any,
+    *,
+    query: str,
+    source: str,
+    max_sample_age_seconds: float | None,
+    now: float | None,
+) -> PrometheusQueryResult:
+    if response.status_code != 200:
+        return PrometheusQueryResult(
+            status=EvidenceStatus.ERROR,
+            query=query,
+            source=source,
+            error=(
+                f"HTTP {response.status_code}: "
+                f"{_bounded_error(getattr(response, 'text', ''))}"
+            ),
+        )
     try:
-        response = await client.get(URL, params=params, timeout=10)
-        if response.status_code == 200:
-            return response.json()['data']['result']
-        else:
-            return f"Error: {response.status_code} - {response.text}"
-    except Exception as e:
-        return f"Connection Failed: {str(e)}"
+        payload = response.json()
+    except (TypeError, ValueError) as exc:
+        return PrometheusQueryResult(
+            status=EvidenceStatus.ERROR,
+            query=query,
+            source=source,
+            error=f"invalid JSON: {_bounded_error(exc)}",
+        )
+    if payload.get("status", "success") != "success":
+        return PrometheusQueryResult(
+            status=EvidenceStatus.ERROR,
+            query=query,
+            source=source,
+            error=_bounded_error(payload.get("error", "query failed")),
+        )
+    data = payload.get("data")
+    samples = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(samples, list):
+        return PrometheusQueryResult(
+            status=EvidenceStatus.ERROR,
+            query=query,
+            source=source,
+            error="response data.result is not a list",
+        )
+    if not samples:
+        return PrometheusQueryResult(
+            status=EvidenceStatus.MISSING,
+            query=query,
+            source=source,
+            error="query returned no series",
+        )
+
+    observed_at = _latest_sample_timestamp(samples)
+    if (
+        max_sample_age_seconds is not None
+        and observed_at is not None
+        and (now if now is not None else time.time()) - observed_at
+        > max_sample_age_seconds
+    ):
+        return PrometheusQueryResult(
+            status=EvidenceStatus.STALE,
+            query=query,
+            source=source,
+            samples=samples,
+            observed_at=observed_at,
+            error=(
+                f"newest sample is older than {max_sample_age_seconds:.0f}s"
+            ),
+        )
+    return PrometheusQueryResult(
+        status=EvidenceStatus.OK,
+        query=query,
+        source=source,
+        samples=samples,
+        observed_at=observed_at,
+    )
 
 
-# ── Node Exporter Metrics ──
+async def query_prometheus(
+    prom_ql,
+    client,
+    prometheus_url,
+    *,
+    max_sample_age_seconds=300,
+    now=None,
+):
+    """Execute an instant PromQL query and return a typed result."""
+    url = f"{prometheus_url}/api/v1/query"
+    logger.debug("querying prometheus: %s query=%s", url, prom_ql[:80])
+    try:
+        response = await client.get(
+            url,
+            params={"query": prom_ql},
+            timeout=10,
+        )
+    except Exception as exc:
+        return PrometheusQueryResult(
+            status=EvidenceStatus.ERROR,
+            query=prom_ql,
+            source=url,
+            error=f"connection failed: {_bounded_error(exc)}",
+        )
+    return _parse_response(
+        response,
+        query=prom_ql,
+        source=url,
+        max_sample_age_seconds=max_sample_age_seconds,
+        now=now,
+    )
 
-async def get_memory_usage_percent(instance, client, prometheus_url):
-    """Get current memory usage percentage for an instance."""
+
+async def query_prometheus_range(
+    prom_ql,
+    start,
+    end,
+    client,
+    prometheus_url,
+    step="1m",
+):
+    """Execute a range PromQL query and return a typed result."""
+    url = f"{prometheus_url}/api/v1/query_range"
+    try:
+        response = await client.get(
+            url,
+            params={
+                "query": prom_ql,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "step": step,
+            },
+            timeout=10,
+        )
+    except Exception as exc:
+        return PrometheusQueryResult(
+            status=EvidenceStatus.ERROR,
+            query=prom_ql,
+            source=url,
+            error=f"connection failed: {_bounded_error(exc)}",
+        )
+    return _parse_response(
+        response,
+        query=prom_ql,
+        source=url,
+        max_sample_age_seconds=None,
+        now=None,
+    )
+
+
+def _reading_from_first_sample(
+    result: PrometheusQueryResult,
+    *,
+    name: str,
+    target: str,
+    exporter: str,
+) -> MetricReading:
+    if result.status is not EvidenceStatus.OK:
+        return MetricReading(
+            name=name,
+            target=target,
+            exporter=exporter,
+            status=result.status,
+            observed_at=result.observed_at,
+            error=result.error,
+        )
+    try:
+        value = float(result.samples[0]["value"][1])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        return MetricReading(
+            name=name,
+            target=target,
+            exporter=exporter,
+            status=EvidenceStatus.ERROR,
+            observed_at=result.observed_at,
+            error=f"invalid sample: {_bounded_error(exc)}",
+        )
+    if not math.isfinite(value):
+        return MetricReading(
+            name=name,
+            target=target,
+            exporter=exporter,
+            status=EvidenceStatus.ERROR,
+            observed_at=result.observed_at,
+            error=f"non-finite sample value: {value}",
+        )
+    return MetricReading(
+        name=name,
+        target=target,
+        exporter=exporter,
+        status=EvidenceStatus.OK,
+        value=value,
+        observed_at=result.observed_at,
+    )
+
+
+async def _scalar_reading(
+    query,
+    name,
+    target,
+    exporter,
+    client,
+    prometheus_url,
+    max_sample_age_seconds,
+):
+    result = await query_prometheus(
+        query,
+        client,
+        prometheus_url,
+        max_sample_age_seconds=max_sample_age_seconds,
+    )
+    return _reading_from_first_sample(
+        result,
+        name=name,
+        target=target,
+        exporter=exporter,
+    )
+
+
+async def get_target_health(
+    instance,
+    exporter,
+    client,
+    prometheus_url,
+    max_sample_age_seconds=300,
+):
+    return await _scalar_reading(
+        f'up{{instance="{instance}"}}',
+        f"{exporter}_up",
+        instance,
+        exporter,
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
+
+
+async def get_memory_usage_percent(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
     query = (
         f'100 - (node_memory_MemAvailable_bytes{{instance="{instance}"}} '
         f'/ node_memory_MemTotal_bytes{{instance="{instance}"}} * 100)'
     )
-    result = await query_prometheus(query, client, prometheus_url)
-    if isinstance(result, list) and result:
-        return float(result[0]['value'][1])
-    return 0.0
+    return await _scalar_reading(
+        query,
+        "memory_percent",
+        instance,
+        "node_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
 
 
-async def _get_first_sample_value(query, client, prometheus_url):
-    """Return the first finite-looking Prometheus sample or zero."""
-    result = await query_prometheus(query, client, prometheus_url)
-    if isinstance(result, list) and result:
-        try:
-            value = float(result[0]["value"][1])
-        except (KeyError, IndexError, TypeError, ValueError):
-            return 0.0
-        if value >= 0:
-            return value
-    return 0.0
-
-
-async def get_memory_pressure_metrics(instance, client, prometheus_url):
-    """Return memory, swap activity, and secondary CPU-pressure signals.
-
-    Swap usage alone is not proof of current thrashing because inactive pages
-    can remain swapped out after an incident. The pswpin/pswpout rates provide
-    the current activity needed for that distinction.
-    """
+async def get_memory_pressure_metrics(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
+    """Return memory values plus component-level telemetry state."""
     selector = f'instance="{instance}"'
-    available = await _get_first_sample_value(
-        f'node_memory_MemAvailable_bytes{{{selector}}}',
-        client,
-        prometheus_url,
-    )
-    total = await _get_first_sample_value(
-        f'node_memory_MemTotal_bytes{{{selector}}}',
-        client,
-        prometheus_url,
-    )
-    swap_total = await _get_first_sample_value(
-        f'node_memory_SwapTotal_bytes{{{selector}}}',
-        client,
-        prometheus_url,
-    )
-    swap_free = await _get_first_sample_value(
-        f'node_memory_SwapFree_bytes{{{selector}}}',
-        client,
-        prometheus_url,
-    )
-    swap_in = await _get_first_sample_value(
-        f'rate(node_vmstat_pswpin{{{selector}}}[2m])',
-        client,
-        prometheus_url,
-    )
-    swap_out = await _get_first_sample_value(
-        f'rate(node_vmstat_pswpout{{{selector}}}[2m])',
-        client,
-        prometheus_url,
-    )
-    system_cpu = await _get_first_sample_value(
-        (
-            f'avg(irate(node_cpu_seconds_total{{{selector},'
-            'mode="system"}[2m])) * 100'
+    specs = {
+        "memory_available_bytes": f"node_memory_MemAvailable_bytes{{{selector}}}",
+        "memory_total_bytes": f"node_memory_MemTotal_bytes{{{selector}}}",
+        "swap_total_bytes": f"node_memory_SwapTotal_bytes{{{selector}}}",
+        "swap_free_bytes": f"node_memory_SwapFree_bytes{{{selector}}}",
+        "swap_in_pages_per_second": (
+            f"rate(node_vmstat_pswpin{{{selector}}}[2m])"
         ),
-        client,
-        prometheus_url,
-    )
-    iowait_cpu = await _get_first_sample_value(
-        (
-            f'avg(irate(node_cpu_seconds_total{{{selector},'
-            'mode="iowait"}[2m])) * 100'
+        "swap_out_pages_per_second": (
+            f"rate(node_vmstat_pswpout{{{selector}}}[2m])"
         ),
-        client,
-        prometheus_url,
-    )
+        "system_cpu_percent": (
+            f'avg(irate(node_cpu_seconds_total{{{selector},mode="system"}}[2m])) * 100'
+        ),
+        "iowait_cpu_percent": (
+            f'avg(irate(node_cpu_seconds_total{{{selector},mode="iowait"}}[2m])) * 100'
+        ),
+    }
+    readings = {}
+    for name, query in specs.items():
+        readings[name] = await _scalar_reading(
+            query,
+            name,
+            instance,
+            "node_exporter",
+            client,
+            prometheus_url,
+            max_sample_age_seconds,
+        )
 
-    memory_usage = (
-        max(0.0, min(100.0, 100.0 - (available / total * 100.0)))
-        if total > 0
-        else 0.0
-    )
-    swap_used = max(0.0, swap_total - min(swap_free, swap_total))
-    swap_usage = (
-        max(0.0, min(100.0, swap_used / swap_total * 100.0))
-        if swap_total > 0
-        else 0.0
+    values = {
+        name: reading.value if reading.usable else None
+        for name, reading in readings.items()
+    }
+    available = values["memory_available_bytes"]
+    total = values["memory_total_bytes"]
+    swap_total = values["swap_total_bytes"]
+    swap_free = values["swap_free_bytes"]
+    swap_in = values["swap_in_pages_per_second"]
+    swap_out = values["swap_out_pages_per_second"]
+
+    memory_usage = None
+    if available is not None and total is not None and total > 0:
+        memory_usage = max(
+            0.0,
+            min(100.0, 100.0 - (available / total * 100.0)),
+        )
+
+    swap_used = None
+    swap_usage = None
+    if swap_total is not None and swap_free is not None:
+        swap_used = max(0.0, swap_total - min(swap_free, swap_total))
+        swap_usage = (
+            max(0.0, min(100.0, swap_used / swap_total * 100.0))
+            if swap_total > 0
+            else 0.0
+        )
+    swap_activity = (
+        swap_in + swap_out
+        if swap_in is not None and swap_out is not None
+        else None
     )
     return {
         "memory_usage_percent": memory_usage,
@@ -160,72 +412,101 @@ async def get_memory_pressure_metrics(instance, client, prometheus_url):
         "swap_usage_percent": swap_usage,
         "swap_in_pages_per_second": swap_in,
         "swap_out_pages_per_second": swap_out,
-        "swap_activity_pages_per_second": swap_in + swap_out,
-        "system_cpu_percent": system_cpu,
-        "iowait_cpu_percent": iowait_cpu,
+        "swap_activity_pages_per_second": swap_activity,
+        "system_cpu_percent": values["system_cpu_percent"],
+        "iowait_cpu_percent": values["iowait_cpu_percent"],
+        "_telemetry": {
+            name: reading.as_dict() for name, reading in readings.items()
+        },
     }
 
 
-async def get_cpu_usage_percent(instance, client, prometheus_url):
-    """Get current CPU usage percentage for an instance."""
+async def get_cpu_usage_percent(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
     query = (
-        f'100 - (avg(irate(node_cpu_seconds_total'
+        "100 - (avg(irate(node_cpu_seconds_total"
         f'{{instance="{instance}",mode="idle"}}[5m])) * 100)'
     )
-    result = await query_prometheus(query, client, prometheus_url)
-    if isinstance(result, list) and result:
-        return float(result[0]['value'][1])
-    return 0.0
+    return await _scalar_reading(
+        query,
+        "cpu_percent",
+        instance,
+        "node_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
 
 
-async def get_disk_usage_percent(instance, client, prometheus_url, mountpoint="/"):
-    """Get disk usage percentage for a mountpoint on an instance."""
+async def get_disk_usage_percent(
+    instance,
+    client,
+    prometheus_url,
+    mountpoint="/",
+    max_sample_age_seconds=300,
+):
     query = (
-        f'100 - (node_filesystem_avail_bytes'
+        "100 - (node_filesystem_avail_bytes"
         f'{{instance="{instance}",mountpoint="{mountpoint}"}} '
-        f'/ node_filesystem_size_bytes'
+        "/ node_filesystem_size_bytes"
         f'{{instance="{instance}",mountpoint="{mountpoint}"}} * 100)'
     )
-    result = await query_prometheus(query, client, prometheus_url)
-    if isinstance(result, list) and result:
-        return float(result[0]['value'][1])
-    return 0.0
+    return await _scalar_reading(
+        query,
+        f"filesystem_usage:{mountpoint}",
+        instance,
+        "node_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
 
 
-async def get_filesystem_usage_percent(instance, client, prometheus_url):
-    """Return usage for every writable, persistent filesystem on an instance.
-
-    Filesystems are discovered from node_exporter labels, so adding or removing
-    a mount does not require an agent configuration change.
-    """
+async def get_filesystem_usage_percent(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
+    """Return a reading containing every writable persistent filesystem."""
     excluded_fstypes = (
         "autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|"
         "fusectl|hugetlbfs|mqueue|overlay|proc|pstore|ramfs|securityfs|"
         "squashfs|sysfs|tracefs|tmpfs"
     )
-    selector = (
-        f'instance="{instance}",'
-        f'fstype!~"{excluded_fstypes}"'
-    )
+    selector = f'instance="{instance}",fstype!~"{excluded_fstypes}"'
     query = (
-        f'(100 - (node_filesystem_avail_bytes{{{selector}}} '
-        f'/ node_filesystem_size_bytes{{{selector}}} * 100)) '
-        f'and on(instance,device,mountpoint) '
+        f"(100 - (node_filesystem_avail_bytes{{{selector}}} "
+        f"/ node_filesystem_size_bytes{{{selector}}} * 100)) "
+        "and on(instance,device,mountpoint) "
         f'(node_filesystem_readonly{{instance="{instance}"}} == 0)'
     )
-    result = await query_prometheus(query, client, prometheus_url)
-    if not isinstance(result, list):
-        return []
+    result = await query_prometheus(
+        query,
+        client,
+        prometheus_url,
+        max_sample_age_seconds=max_sample_age_seconds,
+    )
+    if result.status is not EvidenceStatus.OK:
+        return MetricReading(
+            name="filesystems",
+            target=instance,
+            exporter="node_exporter",
+            status=result.status,
+            observed_at=result.observed_at,
+            error=result.error,
+        )
 
     filesystems = []
-    for sample in result:
+    invalid_samples = 0
+    for sample in result.samples:
         metric = sample.get("metric", {})
         try:
             usage = float(sample["value"][1])
         except (KeyError, IndexError, TypeError, ValueError):
+            invalid_samples += 1
             continue
         mountpoint = metric.get("mountpoint")
-        if not mountpoint or usage < 0 or usage > 100:
+        if not mountpoint or not math.isfinite(usage) or usage < 0 or usage > 100:
+            invalid_samples += 1
             continue
         filesystems.append({
             "mountpoint": mountpoint,
@@ -233,107 +514,184 @@ async def get_filesystem_usage_percent(instance, client, prometheus_url):
             "fstype": metric.get("fstype", "unknown"),
             "usage_percent": usage,
         })
-    return sorted(filesystems, key=lambda item: item["mountpoint"])
-
-
-# ── Apache Exporter Metrics ──
-
-async def get_apache_busy_workers_percent(instance, client, prometheus_url):
-    """Get Apache busy workers as a percentage of total workers.
-
-    Uses apache_workers{state="busy"} / (busy + idle) * 100
-    from the apache_exporter on :9117.
-    """
-    busy_query = f'apache_workers{{instance="{instance}",state="busy"}}'
-    idle_query = f'apache_workers{{instance="{instance}",state="idle"}}'
-
-    busy_result = await query_prometheus(busy_query, client, prometheus_url)
-    idle_result = await query_prometheus(idle_query, client, prometheus_url)
-
-    busy = 0.0
-    idle = 0.0
-    if isinstance(busy_result, list) and busy_result:
-        busy = float(busy_result[0]['value'][1])
-    if isinstance(idle_result, list) and idle_result:
-        idle = float(idle_result[0]['value'][1])
-
-    total = busy + idle
-    if total == 0:
-        return 0.0
-    return (busy / total) * 100
-
-
-async def get_apache_requests_per_sec(instance, client, prometheus_url):
-    """Get Apache request rate (requests per second over 5m window).
-
-    Uses rate(apache_accesses_total[5m]) from the apache_exporter.
-    """
-    query = f'rate(apache_accesses_total{{instance="{instance}"}}[5m])'
-    result = await query_prometheus(query, client, prometheus_url)
-    if isinstance(result, list) and result:
-        return float(result[0]['value'][1])
-    return 0.0
-
-
-# ── PostgreSQL Exporter Metrics ──
-
-async def get_postgres_active_connections_percent(instance, client, prometheus_url):
-    """Get total PostgreSQL connections as a percentage of max_connections.
-
-    Uses sum(pg_stat_database_numbackends) for total connections and
-    pg_settings_max_connections from the postgres_exporter on :9187.
-    Counts ALL connections (active + idle + idle-in-transaction) since
-    connection exhaustion is the real concern regardless of state.
-    """
-    backends_query = (
-        f'sum(pg_stat_database_numbackends{{instance="{instance}"}})'
-    )
-    max_query = (
-        f'pg_settings_max_connections{{instance="{instance}"}}'
+    if not filesystems:
+        return MetricReading(
+            name="filesystems",
+            target=instance,
+            exporter="node_exporter",
+            status=EvidenceStatus.ERROR,
+            observed_at=result.observed_at,
+            error=f"no valid filesystem samples ({invalid_samples} invalid)",
+        )
+    return MetricReading(
+        name="filesystems",
+        target=instance,
+        exporter="node_exporter",
+        status=EvidenceStatus.OK,
+        value=sorted(filesystems, key=lambda item: item["mountpoint"]),
+        observed_at=result.observed_at,
     )
 
-    backends_result = await query_prometheus(backends_query, client, prometheus_url)
-    max_result = await query_prometheus(max_query, client, prometheus_url)
 
-    backends = 0.0
-    max_conn = 100.0  # safe default
-    if isinstance(backends_result, list) and backends_result:
-        backends = float(backends_result[0]['value'][1])
-    if isinstance(max_result, list) and max_result:
-        max_conn = float(max_result[0]['value'][1])
-
-    if max_conn == 0:
-        return 0.0
-    return (backends / max_conn) * 100
-
-
-async def get_postgres_deadlocks_per_min(instance, client, prometheus_url):
-    """Get PostgreSQL deadlock rate (deadlocks per minute over 5m window).
-
-    Uses rate(pg_stat_database_deadlocks[5m]) * 60 from the postgres_exporter.
-    """
-    query = (
-        f'sum(rate(pg_stat_database_deadlocks{{instance="{instance}"}}[5m])) * 60'
+async def get_apache_busy_workers_percent(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
+    busy = await _scalar_reading(
+        f'apache_workers{{instance="{instance}",state="busy"}}',
+        "apache_busy_workers",
+        instance,
+        "apache_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
     )
-    result = await query_prometheus(query, client, prometheus_url)
-    if isinstance(result, list) and result:
-        return float(result[0]['value'][1])
-    return 0.0
+    idle = await _scalar_reading(
+        f'apache_workers{{instance="{instance}",state="idle"}}',
+        "apache_idle_workers",
+        instance,
+        "apache_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
+    failed = next((reading for reading in (busy, idle) if not reading.usable), None)
+    if failed:
+        return MetricReading(
+            name="apache_busy_workers_percent",
+            target=instance,
+            exporter="apache_exporter",
+            status=failed.status,
+            observed_at=failed.observed_at,
+            error=failed.error,
+        )
+    total = busy.value + idle.value
+    if total <= 0:
+        return MetricReading(
+            name="apache_busy_workers_percent",
+            target=instance,
+            exporter="apache_exporter",
+            status=EvidenceStatus.ERROR,
+            observed_at=busy.observed_at,
+            error="busy + idle workers is zero",
+        )
+    return MetricReading(
+        name="apache_busy_workers_percent",
+        target=instance,
+        exporter="apache_exporter",
+        status=EvidenceStatus.OK,
+        value=busy.value / total * 100.0,
+        observed_at=busy.observed_at,
+    )
 
 
-# ── Combined Metrics ──
+async def get_apache_requests_per_sec(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
+    return await _scalar_reading(
+        f'rate(apache_accesses_total{{instance="{instance}"}}[5m])',
+        "apache_requests_per_sec",
+        instance,
+        "apache_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
 
-async def get_all_metrics(instance, client, config, apache_instance=None, postgres_instance=None):
-    """Get all key metrics for an instance. Returns a dict summary.
 
-    Includes node_exporter metrics always. Apache and PostgreSQL metrics
-    are included only if their exporter instances are configured.
+async def get_postgres_active_connections_percent(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
+    backends = await _scalar_reading(
+        f'sum(pg_stat_database_numbackends{{instance="{instance}"}})',
+        "postgres_connections",
+        instance,
+        "postgres_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
+    maximum = await _scalar_reading(
+        f'pg_settings_max_connections{{instance="{instance}"}}',
+        "postgres_max_connections",
+        instance,
+        "postgres_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
+    failed = next(
+        (reading for reading in (backends, maximum) if not reading.usable),
+        None,
+    )
+    if failed:
+        return MetricReading(
+            name="postgres_active_connections_percent",
+            target=instance,
+            exporter="postgres_exporter",
+            status=failed.status,
+            observed_at=failed.observed_at,
+            error=failed.error,
+        )
+    if maximum.value <= 0:
+        return MetricReading(
+            name="postgres_active_connections_percent",
+            target=instance,
+            exporter="postgres_exporter",
+            status=EvidenceStatus.ERROR,
+            observed_at=maximum.observed_at,
+            error="max_connections is not positive",
+        )
+    return MetricReading(
+        name="postgres_active_connections_percent",
+        target=instance,
+        exporter="postgres_exporter",
+        status=EvidenceStatus.OK,
+        value=backends.value / maximum.value * 100.0,
+        observed_at=backends.observed_at,
+    )
 
-    Metrics are fetched sequentially (no inner parallelism).
-    """
+
+async def get_postgres_deadlocks_per_min(
+    instance, client, prometheus_url, max_sample_age_seconds=300
+):
+    return await _scalar_reading(
+        f'sum(rate(pg_stat_database_deadlocks{{instance="{instance}"}}[5m])) * 60',
+        "postgres_deadlocks_per_min",
+        instance,
+        "postgres_exporter",
+        client,
+        prometheus_url,
+        max_sample_age_seconds,
+    )
+
+
+async def get_all_metrics(
+    instance,
+    client,
+    config,
+    apache_instance=None,
+    postgres_instance=None,
+):
+    """Return values plus a typed ``telemetry`` map for every query."""
     prometheus_url = config["prometheus"]["url"]
-    filesystems = await get_filesystem_usage_percent(
-        instance, client, prometheus_url
+    max_age = config["prometheus"].get("max_sample_age_seconds", 300)
+    telemetry: dict[str, dict[str, Any]] = {}
+
+    node_up = await get_target_health(
+        instance,
+        "node_exporter",
+        client,
+        prometheus_url,
+        max_age,
+    )
+    telemetry[node_up.name] = node_up.as_dict()
+
+    filesystems_reading = await get_filesystem_usage_percent(
+        instance, client, prometheus_url, max_age
+    )
+    telemetry[filesystems_reading.name] = filesystems_reading.as_dict()
+    filesystems = (
+        filesystems_reading.value if filesystems_reading.usable else []
     )
     root_usage = next(
         (
@@ -341,33 +699,70 @@ async def get_all_metrics(instance, client, config, apache_instance=None, postgr
             for fs in filesystems
             if fs["mountpoint"] == "/"
         ),
-        0.0,
+        None,
     )
+
     memory_pressure = await get_memory_pressure_metrics(
-        instance, client, prometheus_url
+        instance, client, prometheus_url, max_age
     )
+    telemetry.update(memory_pressure.pop("_telemetry"))
+    cpu = await get_cpu_usage_percent(
+        instance, client, prometheus_url, max_age
+    )
+    telemetry[cpu.name] = cpu.as_dict()
     metrics = {
         "memory_percent": memory_pressure["memory_usage_percent"],
         "memory_pressure": memory_pressure,
-        "cpu_percent": await get_cpu_usage_percent(instance, client, prometheus_url),
+        "cpu_percent": cpu.value if cpu.usable else None,
         "disk_percent": root_usage,
         "filesystems": filesystems,
+        "telemetry": telemetry,
     }
 
     if apache_instance:
-        metrics["apache_busy_workers_percent"] = await get_apache_busy_workers_percent(
-            apache_instance, client, prometheus_url
+        apache_up = await get_target_health(
+            apache_instance,
+            "apache_exporter",
+            client,
+            prometheus_url,
+            max_age,
         )
-        metrics["apache_requests_per_sec"] = await get_apache_requests_per_sec(
-            apache_instance, client, prometheus_url
+        busy = await get_apache_busy_workers_percent(
+            apache_instance, client, prometheus_url, max_age
         )
+        rps = await get_apache_requests_per_sec(
+            apache_instance, client, prometheus_url, max_age
+        )
+        for reading in (apache_up, busy, rps):
+            telemetry[reading.name] = reading.as_dict()
+        metrics.update({
+            "apache_busy_workers_percent": busy.value if busy.usable else None,
+            "apache_requests_per_sec": rps.value if rps.usable else None,
+        })
 
     if postgres_instance:
-        metrics["postgres_active_connections_percent"] = await get_postgres_active_connections_percent(
-            postgres_instance, client, prometheus_url
+        postgres_up = await get_target_health(
+            postgres_instance,
+            "postgres_exporter",
+            client,
+            prometheus_url,
+            max_age,
         )
-        metrics["postgres_deadlocks_per_min"] = await get_postgres_deadlocks_per_min(
-            postgres_instance, client, prometheus_url
+        connections = await get_postgres_active_connections_percent(
+            postgres_instance, client, prometheus_url, max_age
         )
+        deadlocks = await get_postgres_deadlocks_per_min(
+            postgres_instance, client, prometheus_url, max_age
+        )
+        for reading in (postgres_up, connections, deadlocks):
+            telemetry[reading.name] = reading.as_dict()
+        metrics.update({
+            "postgres_active_connections_percent": (
+                connections.value if connections.usable else None
+            ),
+            "postgres_deadlocks_per_min": (
+                deadlocks.value if deadlocks.usable else None
+            ),
+        })
 
     return metrics

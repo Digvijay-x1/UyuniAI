@@ -56,3 +56,15 @@ def test_service_log_line_count_is_bounded_before_network_access():
 
     with pytest.raises(ValueError, match="between 1 and 200"):
         asyncio.run(client.service_logs("client", "apache2", lines=1000))
+
+
+def test_false_cmd_run_result_is_normalized_to_inspection_failure(monkeypatch):
+    client = SaltAPIClient(salt_config())
+
+    async def false_result(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(client, "_safe_call", false_result)
+    result = asyncio.run(client.run_command("client", "true"))
+
+    assert result == "Salt API call failed: minion returned no cmd.run result"

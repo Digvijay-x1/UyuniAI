@@ -48,11 +48,25 @@ class Urgency(str, Enum):
     CRITICAL = "Critical"
 
 
+class AnalysisConclusion(str, Enum):
+    """Whether the collected evidence proves a root cause."""
+
+    CONFIRMED = "confirmed"
+    INCONCLUSIVE = "inconclusive"
+
+
 class RootCauseAnalysis(BaseModel):
     """Structured root-cause analysis produced by the investigation agent."""
 
     summary: str = Field(
         description="One-line summary of the issue, suitable for an alert title.",
+    )
+    conclusion: AnalysisConclusion = Field(
+        default=AnalysisConclusion.INCONCLUSIVE,
+        description=(
+            "Use 'confirmed' only when the root cause is directly supported "
+            "by cited evidence IDs. Otherwise use 'inconclusive'."
+        ),
     )
     affected_component: str = Field(
         description=(
@@ -64,14 +78,23 @@ class RootCauseAnalysis(BaseModel):
     root_cause: str = Field(
         description=(
             "One or two sentences identifying the root cause, grounded in the "
-            "evidence gathered from the Salt tool outputs."
+            "evidence gathered from the inspection outputs. A confirmed root "
+            "cause must contain citations such as [E1] or [E2]."
+        ),
+    )
+    supporting_evidence_ids: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Evidence ledger IDs that directly support the conclusion, for "
+            "example ['E1', 'E3']. Do not invent IDs."
         ),
     )
     key_evidence: List[str] = Field(
         default_factory=list,
         description=(
-            "2-3 concrete data points from tool outputs that support the root "
-            "cause (e.g. 'postgres using 14.2GB RSS', 'disk /var at 98%')."
+            "2-3 concrete data points that support the root cause. Every item "
+            "must cite its evidence ledger record, for example '[E2] disk "
+            "/var at 98%'."
         ),
     )
     remediation: List[str] = Field(
@@ -105,6 +128,7 @@ class RootCauseAnalysis(BaseModel):
         evidence = "\n".join(f"- {e}" for e in self.key_evidence) or "- (none)"
         steps = "\n".join(f"{i}. {s}" for i, s in enumerate(self.remediation, 1)) or "1. (none)"
         return (
+            f"*Conclusion:* {self.conclusion.value}\n\n"
             f"*Root Cause:* {self.root_cause}\n\n"
             f"*Affected Component:* {self.affected_component}\n\n"
             f"*Key Evidence:*\n{evidence}\n\n"

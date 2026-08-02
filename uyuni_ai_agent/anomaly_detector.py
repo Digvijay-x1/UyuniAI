@@ -53,6 +53,9 @@ class Anomaly:
 
 def _check_threshold(value, thresholds, minion_id, metric_name, label):
     """Check a value against warning/critical thresholds. Returns Anomaly or None."""
+    if value is None:
+        return None
+    value = float(value)
     if value >= thresholds.get("critical", float("inf")):
         return Anomaly(
             minion_id, metric_name, value,
@@ -107,6 +110,45 @@ def parse_failed_systemd_services(output):
     return services
 
 
+def _salt_inspection_failure(output):
+    """Return a bounded failure message, or None for valid command output."""
+    if output is False or output is None:
+        return "Salt minion returned no command result"
+    if not isinstance(output, str):
+        return f"Salt returned unexpected {type(output).__name__} output"
+    stripped = output.strip()
+    failure_markers = (
+        "salt api call failed:",
+        "minion did not return",
+        "no response from any minions",
+    )
+    if any(marker in stripped.lower() for marker in failure_markers):
+        return stripped[:500]
+    return None
+
+
+def _salt_telemetry_anomaly(minion_id, check, failure):
+    return Anomaly(
+        minion_id=minion_id,
+        metric_name="telemetry_unavailable",
+        current_value=1.0,
+        threshold=1.0,
+        severity=AlertSeverity.WARNING,
+        description=f"Salt inspection telemetry for {minion_id} is unavailable",
+        resource=f"telemetry:salt_inspection:{minion_id}",
+        context={
+            "source": "salt",
+            "exporter": "salt_inspection",
+            "target": minion_id,
+            "observations": [{
+                "name": check,
+                "status": "error",
+                "error": failure,
+            }],
+        },
+    )
+
+
 async def check_failed_services(minion_id, salt_client, config):
     """Discover failed systemd services without a per-service allowlist."""
     service_cfg = config.get("service_monitoring", {})
@@ -114,6 +156,11 @@ async def check_failed_services(minion_id, salt_client, config):
         return []
 
     output = await salt_client.failed_systemd_services(minion_id)
+    failure = _salt_inspection_failure(output)
+    if failure:
+        return [_salt_telemetry_anomaly(
+            minion_id, "systemd_service_discovery", failure
+        )]
     ignored = service_cfg.get("ignored_units", [])
     anomalies = []
     for service in parse_failed_systemd_services(output):
@@ -199,10 +246,11 @@ def _is_apache_dependency_candidate(
     anomaly,
     traffic_spike_threshold=_DEFAULT_APACHE_TRAFFIC_THRESHOLD,
 ):
+    requests_per_second = anomaly.context.get("requests_per_second")
     return (
         anomaly.metric_name == "apache_busy_workers"
-        and float(anomaly.context.get("requests_per_second", 0.0))
-        < float(traffic_spike_threshold)
+        and requests_per_second is not None
+        and float(requests_per_second) < float(traffic_spike_threshold)
     )
 
 
@@ -435,6 +483,11 @@ async def check_postgres_blocked_transactions(minion_id, salt_client, config):
         return []
 
     output = await salt_client.postgres_blocking_activity(minion_id)
+    failure = _salt_inspection_failure(output)
+    if failure:
+        return [_salt_telemetry_anomaly(
+            minion_id, "postgres_lock_discovery", failure
+        )]
     pairs = parse_postgres_lock_pairs(output)
     thresholds = (
         config.get("thresholds", {})
@@ -475,7 +528,10 @@ def memory_pressure_anomaly(memory_metrics, thresholds, minion_id):
     pswpin/pswpout rates are tracked separately and are required before a CPU
     alert can be treated as a secondary effect of swapping.
     """
-    usage = float(memory_metrics.get("memory_usage_percent", 0.0))
+    raw_usage = memory_metrics.get("memory_usage_percent")
+    if raw_usage is None:
+        return None
+    usage = float(raw_usage)
     warning = float(thresholds.get("warning", float("inf")))
     critical = float(thresholds.get("critical", float("inf")))
     if usage < warning:
@@ -488,10 +544,10 @@ def memory_pressure_anomaly(memory_metrics, thresholds, minion_id):
     swap_usage_thresholds = pressure_thresholds.get(
         "swap_usage_percent", {}
     )
-    activity = float(
-        memory_metrics.get("swap_activity_pages_per_second", 0.0)
-    )
-    swap_usage = float(memory_metrics.get("swap_usage_percent", 0.0))
+    raw_activity = memory_metrics.get("swap_activity_pages_per_second")
+    raw_swap_usage = memory_metrics.get("swap_usage_percent")
+    activity = float(raw_activity) if raw_activity is not None else 0.0
+    swap_usage = float(raw_swap_usage) if raw_swap_usage is not None else 0.0
     activity_warning = float(activity_thresholds.get("warning", 1.0))
     activity_critical = float(activity_thresholds.get("critical", 100.0))
     swap_usage_critical = float(swap_usage_thresholds.get("critical", 25.0))
@@ -529,6 +585,93 @@ def memory_pressure_anomaly(memory_metrics, thresholds, minion_id):
     )
 
 
+_REQUIRED_TELEMETRY = {
+    "node_exporter": {
+        "memory_available_bytes",
+        "memory_total_bytes",
+        "cpu_percent",
+        "filesystems",
+    },
+    "apache_exporter": {
+        "apache_busy_workers_percent",
+        "apache_requests_per_sec",
+    },
+    "postgres_exporter": {
+        "postgres_active_connections_percent",
+        "postgres_deadlocks_per_min",
+    },
+}
+
+
+def telemetry_anomalies(metrics, minion_id):
+    """Expose monitoring blind spots instead of interpreting them as zero."""
+    observations = metrics.get("telemetry") or {}
+    anomalies = []
+    for exporter, required_names in _REQUIRED_TELEMETRY.items():
+        exporter_observations = {
+            name: observation
+            for name, observation in observations.items()
+            if observation.get("exporter") == exporter
+        }
+        if not exporter_observations:
+            continue
+
+        up = exporter_observations.get(f"{exporter}_up")
+        target = next(iter(exporter_observations.values())).get(
+            "target", "unknown"
+        )
+        failures = []
+        if up is None:
+            failures.append({
+                "name": f"{exporter}_up",
+                "status": "missing",
+                "error": "target health query was not collected",
+            })
+        elif up.get("status") != "ok":
+            failures.append({"name": f"{exporter}_up", **up})
+        elif float(up.get("value", 0.0)) != 1.0:
+            failures.append({
+                "name": f"{exporter}_up",
+                **up,
+                "status": "error",
+                "error": "Prometheus target reports up=0",
+            })
+        else:
+            for name in sorted(required_names):
+                observation = exporter_observations.get(name)
+                if observation is None or observation.get("status") != "ok":
+                    failures.append({
+                        "name": name,
+                        **(observation or {
+                            "status": "missing",
+                            "error": "metric was not collected",
+                        }),
+                    })
+        if not failures:
+            continue
+
+        statuses = sorted({item.get("status", "error") for item in failures})
+        anomaly = Anomaly(
+            minion_id=minion_id,
+            metric_name="telemetry_unavailable",
+            current_value=1.0,
+            threshold=1.0,
+            severity=AlertSeverity.WARNING,
+            description=(
+                f"{exporter} telemetry for {target} is unavailable "
+                f"({', '.join(statuses)})"
+            ),
+            resource=f"telemetry:{exporter}:{target}",
+            context={
+                "exporter": exporter,
+                "target": target,
+                "observations": failures,
+            },
+        )
+        anomalies.append(anomaly)
+    return anomalies
+
+
 async def check_all_metrics(
     instance,
     minion_id,
@@ -557,25 +700,27 @@ async def check_all_metrics(
             postgres_instance=postgres_instance,
         )
 
+    anomalies.extend(telemetry_anomalies(metrics, minion_id))
+
     # ── Node Exporter Checks ──
 
     # Memory check
     memory_metrics = metrics.get("memory_pressure") or {
-        "memory_usage_percent": metrics.get("memory_percent", 0.0),
-        "swap_activity_pages_per_second": 0.0,
-        "swap_usage_percent": 0.0,
+        "memory_usage_percent": metrics.get("memory_percent"),
+        "swap_activity_pages_per_second": None,
+        "swap_usage_percent": None,
     }
     memory_anomaly = memory_pressure_anomaly(
         memory_metrics, thresholds["memory"], minion_id
     )
     if memory_anomaly:
-        memory_anomaly.context["cpu_usage_percent"] = float(
-            metrics.get("cpu_percent", 0.0)
+        memory_anomaly.context["cpu_usage_percent"] = metrics.get(
+            "cpu_percent"
         )
         anomalies.append(memory_anomaly)
 
     # CPU check
-    cpu_usage = float(metrics.get("cpu_percent", 0.0))
+    cpu_usage = metrics.get("cpu_percent")
     anomaly = _check_threshold(
         cpu_usage, thresholds["cpu"], minion_id,
         "cpu", "CPU usage"
@@ -604,7 +749,7 @@ async def check_all_metrics(
     if apache_instance:
         apache_thresholds = thresholds.get("apache", {})
 
-        busy_pct = float(metrics.get("apache_busy_workers_percent", 0.0))
+        busy_pct = metrics.get("apache_busy_workers_percent")
         anomaly = _check_threshold(
             busy_pct,
             apache_thresholds.get("busy_workers_percent", {}),
@@ -617,13 +762,13 @@ async def check_all_metrics(
             anomaly.context.update({
                 "apache_instance": apache_instance,
                 "busy_workers_percent": busy_pct,
-                "requests_per_second": float(
-                    metrics.get("apache_requests_per_sec", 0.0)
+                "requests_per_second": metrics.get(
+                    "apache_requests_per_sec"
                 ),
             })
             anomalies.append(anomaly)
 
-        rps = float(metrics.get("apache_requests_per_sec", 0.0))
+        rps = metrics.get("apache_requests_per_sec")
         anomaly = _check_threshold(
             rps,
             apache_thresholds.get("requests_per_sec", {}),
@@ -645,9 +790,7 @@ async def check_all_metrics(
     if postgres_instance:
         pg_thresholds = thresholds.get("postgres", {})
 
-        conn_pct = float(
-            metrics.get("postgres_active_connections_percent", 0.0)
-        )
+        conn_pct = metrics.get("postgres_active_connections_percent")
         anomaly = _check_threshold(
             conn_pct,
             pg_thresholds.get("active_connections_percent", {}),
@@ -663,12 +806,12 @@ async def check_all_metrics(
             })
             anomalies.append(anomaly)
 
-        deadlocks = float(metrics.get("postgres_deadlocks_per_min", 0.0))
+        deadlocks = metrics.get("postgres_deadlocks_per_min")
         anomaly = _check_threshold(
             deadlocks,
             pg_thresholds.get("deadlocks_per_min", {}),
             minion_id, "postgres_deadlocks",
-            f"PostgreSQL deadlocks/min at {deadlocks:.1f}"
+            "PostgreSQL deadlocks/min"
         )
         if anomaly:
             anomalies.append(anomaly)
