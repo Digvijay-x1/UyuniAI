@@ -86,6 +86,12 @@ def valid_config():
             "max_job_age_seconds": 300,
             "shutdown_grace_seconds": 30,
         },
+        "observability": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 9898,
+            "readiness_max_age_seconds": 180,
+        },
         "concurrency": {
             "max_minions": 8,
             "max_salt_calls": 8,
@@ -132,6 +138,10 @@ def test_valid_config_is_normalized_and_preserves_dictionary_interface():
                 {"max_pending": 0}
             ),
             "greater than or equal to 1",
+        ),
+        (
+            lambda config: config["observability"].update({"port": 70000}),
+            "less than or equal to 65535",
         ),
     ],
 )

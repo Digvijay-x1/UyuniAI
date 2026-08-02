@@ -71,6 +71,7 @@ class _QueueItem:
 
 
 Handler = Callable[[Any], Awaitable[None]]
+Observer = Callable[[QueueStats], None]
 
 
 def priority_for_severity(severity: Any) -> int:
@@ -88,7 +89,13 @@ class InvestigationQueue:
     them later.
     """
 
-    def __init__(self, *, max_pending: int, workers: int):
+    def __init__(
+        self,
+        *,
+        max_pending: int,
+        workers: int,
+        observer: Observer | None = None,
+    ):
         if max_pending < 1:
             raise ValueError("max_pending must be at least 1")
         if workers < 1:
@@ -101,6 +108,7 @@ class InvestigationQueue:
         self._in_flight: set[str] = set()
         self._sequence = itertools.count()
         self._handler: Handler | None = None
+        self._observer = observer
         self._worker_tasks: list[asyncio.Task] = []
         self._accepting = True
         self._closing = False
@@ -111,6 +119,7 @@ class InvestigationQueue:
         self._rejected = 0
         self._evicted = 0
         self._cancelled = 0
+        self._notify_observer()
 
     @property
     def stats(self) -> QueueStats:
@@ -150,7 +159,9 @@ class InvestigationQueue:
         async with self._condition:
             if not self._accepting:
                 self._rejected += 1
-                return self._result(EnqueueStatus.REJECTED_CLOSED)
+                result = self._result(EnqueueStatus.REJECTED_CLOSED)
+                self._notify_observer()
+                return result
             if fingerprint in self._in_flight:
                 return self._result(EnqueueStatus.IN_FLIGHT)
 
@@ -168,7 +179,9 @@ class InvestigationQueue:
                 self._pending[fingerprint] = replacement
                 self._coalesced += 1
                 self._condition.notify()
-                return self._result(EnqueueStatus.COALESCED)
+                result = self._result(EnqueueStatus.COALESCED)
+                self._notify_observer()
+                return result
 
             evicted_fingerprint = None
             if len(self._heap) >= self.max_pending:
@@ -178,7 +191,9 @@ class InvestigationQueue:
                 )
                 if priority >= worst.priority:
                     self._rejected += 1
-                    return self._result(EnqueueStatus.REJECTED_FULL)
+                    result = self._result(EnqueueStatus.REJECTED_FULL)
+                    self._notify_observer()
+                    return result
                 self._heap.remove(worst)
                 heapq.heapify(self._heap)
                 self._pending.pop(worst.fingerprint, None)
@@ -195,10 +210,12 @@ class InvestigationQueue:
             self._pending[fingerprint] = item
             self._enqueued += 1
             self._condition.notify()
-            return self._result(
+            result = self._result(
                 EnqueueStatus.ENQUEUED,
                 evicted_fingerprint=evicted_fingerprint,
             )
+            self._notify_observer()
+            return result
 
     async def cancel(self, fingerprint: str) -> CancelStatus:
         async with self._condition:
@@ -208,6 +225,7 @@ class InvestigationQueue:
                 heapq.heapify(self._heap)
                 self._cancelled += 1
                 self._condition.notify_all()
+                self._notify_observer()
                 return CancelStatus.CANCELLED
             if fingerprint in self._in_flight:
                 return CancelStatus.IN_FLIGHT
@@ -274,6 +292,7 @@ class InvestigationQueue:
             item = heapq.heappop(self._heap)
             self._pending.pop(item.fingerprint, None)
             self._in_flight.add(item.fingerprint)
+            self._notify_observer()
             return item
 
     async def _worker(self, worker_number: int) -> None:
@@ -298,4 +317,13 @@ class InvestigationQueue:
             finally:
                 async with self._condition:
                     self._in_flight.discard(item.fingerprint)
+                    self._notify_observer()
                     self._condition.notify_all()
+
+    def _notify_observer(self) -> None:
+        if self._observer is None:
+            return
+        try:
+            self._observer(self.stats)
+        except Exception:
+            logger.exception("Investigation queue observer failed")

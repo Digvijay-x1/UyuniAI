@@ -352,6 +352,16 @@ class IncidentStore:
                 (resolved_at, fingerprint),
             )
 
+    def count_by_status(self) -> dict[str, int]:
+        """Return bounded lifecycle counts for agent self-observability."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT status, COUNT(*) AS count FROM incidents GROUP BY status"
+            ).fetchall()
+        counts = {"active": 0, "resolved": 0}
+        counts.update({str(row["status"]): int(row["count"]) for row in rows})
+        return counts
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()

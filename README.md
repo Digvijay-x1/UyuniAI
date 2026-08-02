@@ -67,7 +67,30 @@ investigation_queue:
   workers: 3
   max_job_age_seconds: 300
   shutdown_grace_seconds: 30
+
+observability:
+  enabled: true
+  host: 127.0.0.1
+  port: 9898
+  readiness_max_age_seconds: 180
 ```
+
+The observability listener is loopback-only by default and exposes three
+read-only endpoints:
+
+- `/healthz` reports that the agent process and listener are alive.
+- `/readyz` returns HTTP 200 only after at least one minion completed a recent
+  poll; it returns 503 at startup or when successful polling becomes stale.
+- `/metrics` exposes Prometheus-format queue depth and events, poll and
+  investigation latency, incident counts, anomaly observations, delivery
+  outcomes, and Python process metrics.
+
+These metrics intentionally exclude prompts, evidence text, commands, SQL,
+credentials, incident IDs, and resource names. With the default sidecar
+network, verify them locally with
+`podman exec ai-agent python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:9898/metrics').read().decode())"`.
+Binding the listener beyond loopback should be done only when a protected
+Prometheus scrape path has been deliberately configured.
 
 ## Setup
 

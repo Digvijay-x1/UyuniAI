@@ -115,6 +115,18 @@ def test_state_survives_store_restart(tmp_path):
     restarted_store.close()
 
 
+def test_incident_store_reports_bounded_lifecycle_counts():
+    store = IncidentStore(":memory:", cooldown_seconds=60)
+
+    assert store.count_by_status() == {"active": 0, "resolved": 0}
+    changes = store.reconcile("client", [make_service_anomaly()])
+    assert store.count_by_status() == {"active": 1, "resolved": 0}
+    store.mark_resolved(changes.firing[0].fingerprint)
+    assert store.count_by_status() == {"active": 0, "resolved": 1}
+
+    store.close()
+
+
 def test_in_flight_warning_does_not_hide_new_critical_severity():
     store = IncidentStore(":memory:", cooldown_seconds=900)
     warning = make_service_anomaly()

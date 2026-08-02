@@ -161,6 +161,21 @@ class InvestigationQueueSettings(_StrictModel):
     shutdown_grace_seconds: float = Field(default=30, ge=0)
 
 
+class ObservabilitySettings(_StrictModel):
+    enabled: bool = True
+    host: str = Field(default="127.0.0.1", min_length=1)
+    port: int = Field(default=9898, ge=1, le=65535)
+    readiness_max_age_seconds: float = Field(default=180, gt=0)
+
+    @field_validator("host")
+    @classmethod
+    def normalize_host(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+
 class ConcurrencySettings(_StrictModel):
     max_minions: int = Field(gt=0)
     max_salt_calls: int = Field(gt=0)
@@ -201,6 +216,9 @@ class Settings(_StrictModel):
     )
     investigation_queue: InvestigationQueueSettings = Field(
         default_factory=InvestigationQueueSettings
+    )
+    observability: ObservabilitySettings = Field(
+        default_factory=ObservabilitySettings
     )
     concurrency: ConcurrencySettings
 

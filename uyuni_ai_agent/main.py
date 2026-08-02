@@ -29,6 +29,7 @@ from uyuni_ai_agent.investigation_queue import (
     EnqueueStatus,
     InvestigationQueue,
 )
+from uyuni_ai_agent.observability import AgentObservability, ObservabilityServer
 from uyuni_ai_agent.logging_config import setup_logging
 from uyuni_ai_agent.prometheus_client import get_all_metrics
 from uyuni_ai_agent.anomaly_detector import (
@@ -61,6 +62,26 @@ def _metric_text(value, suffix="%"):
     if value is None:
         return "unavailable"
     return f"{float(value):.1f}{suffix}"
+
+
+async def _send_observed_alert(
+    http_client,
+    config,
+    payload,
+    observability,
+    *,
+    state,
+):
+    """Deliver an alert and record the actual result without parsing logs."""
+    started = time.monotonic()
+    result = await send_alert_payload(http_client, config, payload)
+    if observability is not None:
+        observability.record_alert_delivery(
+            state=state,
+            result=result,
+            duration_seconds=time.monotonic() - started,
+        )
+    return result
 
 
 async def detect_minion(
@@ -192,7 +213,7 @@ async def detect_minion(
         return None
 
 
-async def process_firing_investigation(
+async def _process_firing_investigation(
     work,
     http_client,
     config,
@@ -200,6 +221,7 @@ async def process_firing_investigation(
     llm_sem,
     incident_store,
     max_job_age_seconds,
+    observability,
 ):
     """Investigate and deliver one queued incident when it is still current."""
     firing = work.firing
@@ -213,7 +235,7 @@ async def process_firing_investigation(
             age,
             max_job_age_seconds,
         )
-        return
+        return "stale"
     if not incident_store.is_actionable(
         firing.fingerprint, firing.starts_at
     ):
@@ -222,7 +244,7 @@ async def process_firing_investigation(
             "no longer active.",
             firing.fingerprint,
         )
-        return
+        return "obsolete"
 
     logger.warning(
         "INVESTIGATING: %s [%s] incident=%s",
@@ -243,7 +265,7 @@ async def process_firing_investigation(
             "Skipping alert for %s: investigation produced no analysis.",
             anomaly.description,
         )
-        return
+        return "investigation_failed"
     if not incident_store.is_actionable(
         firing.fingerprint, firing.starts_at
     ):
@@ -252,7 +274,7 @@ async def process_firing_investigation(
             "recovered or was replaced while evidence was collected.",
             firing.fingerprint,
         )
-        return
+        return "recovered"
 
     payload = build_alert_payload(
         analysis,
@@ -273,10 +295,12 @@ async def process_firing_investigation(
         and previous_payload.get("labels") != payload.get("labels")
     )
     if labels_changed and not dry_run:
-        transition_result = await send_alert_payload(
+        transition_result = await _send_observed_alert(
             http_client,
             config,
             build_resolved_payload(previous_payload),
+            observability,
+            state="resolved",
         )
         logger.info(
             "AlertManager label-transition resolution: %s",
@@ -288,7 +312,7 @@ async def process_firing_investigation(
                 "Alertmanager identity could not be resolved.",
                 firing.fingerprint,
             )
-            return
+            return "transition_failed"
         if not incident_store.is_actionable(
             firing.fingerprint, firing.starts_at
         ):
@@ -297,7 +321,7 @@ async def process_firing_investigation(
                 "the label transition.",
                 firing.fingerprint,
             )
-            return
+            return "recovered"
 
     if dry_run:
         logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
@@ -307,15 +331,63 @@ async def process_firing_investigation(
             payload,
             starts_at=firing.starts_at,
         )
+        if observability is not None:
+            observability.record_dry_run_delivery(state="firing")
+        return "dry_run"
     else:
         logger.debug("Step 4: sending to AlertManager...")
-        result = await send_alert_payload(http_client, config, payload)
+        result = await _send_observed_alert(
+            http_client,
+            config,
+            payload,
+            observability,
+            state="firing",
+        )
         logger.info("AlertManager: %s", result)
         if alert_delivery_succeeded(result):
             incident_store.mark_emitted(
                 firing.fingerprint,
                 payload,
                 starts_at=firing.starts_at,
+            )
+            return "delivered"
+        return "delivery_failed"
+
+
+async def process_firing_investigation(
+    work,
+    http_client,
+    config,
+    dry_run,
+    llm_sem,
+    incident_store,
+    max_job_age_seconds,
+    observability=None,
+):
+    """Measure one investigation while preserving queue retry semantics."""
+    started = time.monotonic()
+    outcome = "worker_error"
+    severity = str(
+        getattr(work.firing.anomaly.severity, "value", "unknown")
+    )
+    try:
+        outcome = await _process_firing_investigation(
+            work,
+            http_client,
+            config,
+            dry_run,
+            llm_sem,
+            incident_store,
+            max_job_age_seconds,
+            observability,
+        )
+        return outcome
+    finally:
+        if observability is not None:
+            observability.record_investigation(
+                severity=severity,
+                outcome=outcome,
+                duration_seconds=time.monotonic() - started,
             )
 
 
@@ -327,6 +399,7 @@ async def process_minion_anomalies(
     dry_run,
     incident_store,
     investigation_queue,
+    observability=None,
 ):
     """Reconcile one minion and queue only actionable firing work."""
     minion_id = snapshot["minion"]["id"]
@@ -369,10 +442,16 @@ async def process_minion_anomalies(
                     incident.metric_name,
                 )
                 incident_store.mark_resolved(incident.fingerprint)
+                if observability is not None:
+                    observability.record_dry_run_delivery(state="resolved")
                 continue
 
-            result = await send_alert_payload(
-                http_client, config, resolved_payload
+            result = await _send_observed_alert(
+                http_client,
+                config,
+                resolved_payload,
+                observability,
+                state="resolved",
             )
             logger.info("AlertManager resolution: %s", result)
             if alert_delivery_succeeded(result):
@@ -479,6 +558,19 @@ async def run(dry_run=False):
     max_llm_calls = concurrency_cfg.get("max_llm_calls", 5)
     queue_cfg = config.get("investigation_queue", {})
     max_job_age_seconds = queue_cfg.get("max_job_age_seconds", 300)
+    observability_cfg = config.get("observability", {})
+    observability = AgentObservability(
+        readiness_max_age_seconds=observability_cfg.get(
+            "readiness_max_age_seconds", max(60, interval * 3)
+        )
+    )
+    observability_server = None
+    if observability_cfg.get("enabled", True):
+        observability_server = ObservabilityServer(
+            observability,
+            observability_cfg.get("host", "127.0.0.1"),
+            observability_cfg.get("port", 9898),
+        )
 
     minion_sem = asyncio.Semaphore(max_minions)
     llm_sem = asyncio.Semaphore(max_llm_calls)
@@ -500,6 +592,7 @@ async def run(dry_run=False):
     investigation_queue = InvestigationQueue(
         max_pending=queue_cfg.get("max_pending", 50),
         workers=queue_cfg.get("workers", 3),
+        observer=observability.observe_queue,
     )
     correlation_cfg = config.get("dependency_correlation", {})
     apache_traffic_threshold = (
@@ -523,6 +616,8 @@ async def run(dry_run=False):
     salt = SaltAPIClient(config)
     set_salt_client(salt)
     try:
+        if observability_server is not None:
+            await observability_server.start()
         await salt.start()
         await investigation_queue.start(
             lambda work: process_firing_investigation(
@@ -533,9 +628,11 @@ async def run(dry_run=False):
                 llm_sem,
                 incident_store,
                 max_job_age_seconds,
+                observability,
             )
         )
         while not stop.is_set():
+            poll_started = time.monotonic()
             snapshots = await asyncio.gather(*(
                 detect_minion(
                     minion,
@@ -546,6 +643,9 @@ async def run(dry_run=False):
                 )
                 for minion in config["minions"]
             ))
+            successful_minions = sum(
+                1 for snapshot in snapshots if snapshot is not None
+            )
             snapshots = [snapshot for snapshot in snapshots if snapshot]
 
             cycle_anomalies = [
@@ -557,6 +657,7 @@ async def run(dry_run=False):
                 cycle_anomalies,
                 correlation_cfg.get("postgres_apache", []),
             )
+            observability.record_anomaly_observations(cycle_anomalies)
             if dependency_correlator.last_held_count:
                 logger.info(
                     "Holding %d dependency-correlation candidate(s) for "
@@ -574,9 +675,19 @@ async def run(dry_run=False):
                     dry_run,
                     incident_store,
                     investigation_queue,
+                    observability,
                 )
                 for snapshot in snapshots
             ))
+
+            observability.record_incident_counts(
+                incident_store.count_by_status()
+            )
+            poll_outcome = observability.record_poll(
+                duration_seconds=time.monotonic() - poll_started,
+                total_minions=len(config["minions"]),
+                successful_minions=successful_minions,
+            )
 
             queue_stats = investigation_queue.stats
             logger.info(
@@ -588,6 +699,12 @@ async def run(dry_run=False):
                 queue_stats.rejected,
                 queue_stats.evicted,
             )
+            logger.info(
+                "Agent poll outcome=%s successful_minions=%d/%d",
+                poll_outcome,
+                successful_minions,
+                len(config["minions"]),
+            )
             logger.info("Sleeping %ds...", interval)
             # Sleep for the interval, but wake promptly if asked to stop.
             try:
@@ -595,6 +712,9 @@ async def run(dry_run=False):
             except asyncio.TimeoutError:
                 pass  # interval elapsed normally; loop again
     finally:
+        observability.mark_stopping()
+        if observability_server is not None:
+            await observability_server.close()
         shutdown = await investigation_queue.close(
             queue_cfg.get("shutdown_grace_seconds", 30)
         )

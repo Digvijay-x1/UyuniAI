@@ -115,6 +115,16 @@ investigation_queue:
   # Drain briefly on shutdown; unfinished incidents retry after restart.
   shutdown_grace_seconds: 30
 
+# Agent health and low-cardinality self-metrics. Loopback binding avoids a new
+# externally reachable service; deliberately expose it only when a protected
+# Prometheus scrape path has been configured.
+observability:
+  enabled: true
+  host: "127.0.0.1"
+  port: 9898
+  # Readiness fails when no minion poll has succeeded within this window.
+  readiness_max_age_seconds: 180
+
 concurrency:
   max_minions: 8       # minions processed in parallel per cycle
   max_salt_calls: 8   # global cap on concurrent Salt API calls
