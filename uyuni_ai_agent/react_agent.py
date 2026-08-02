@@ -13,53 +13,57 @@
 # limitations under the License.
 
 import asyncio
-import os
 import logging
+import os
 
-from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import SystemMessage
+from langgraph.prebuilt import create_react_agent
 
-from uyuni_ai_agent.llm_provider import get_llm
-from uyuni_ai_agent.models import (
-    AnalysisConclusion,
-    RootCauseAnalysis,
-    Urgency,
-)
+from uyuni_ai_agent import salt_api
+from uyuni_ai_agent.deterministic_analysis import try_deterministic_analysis
+from uyuni_ai_agent.disk_inspection import parse_service_unit_references
 from uyuni_ai_agent.evidence import (
     EvidenceLedger,
     EvidenceStatus,
     evidence_status_for,
     ground_analysis,
 )
-from uyuni_ai_agent import salt_api
-from uyuni_ai_agent.disk_inspection import parse_service_unit_references
-from uyuni_ai_agent.tools.process_tools import (
-    get_cpu_pressure_snapshot,
-    get_memory_pressure_snapshot,
-    get_top_cpu_processes,
-    get_top_memory_processes,
+from uyuni_ai_agent.llm_provider import get_llm
+from uyuni_ai_agent.models import (
+    AnalysisConclusion,
+    RootCauseAnalysis,
+    Urgency,
+)
+from uyuni_ai_agent.tools.apache_tools import (
+    get_apache_access_log,
+    get_apache_config_check,
+    get_apache_error_log,
+    get_apache_overload_snapshot,
+    get_apache_status,
 )
 from uyuni_ai_agent.tools.disk_tools import (
     find_large_files,
     find_service_references,
     get_disk_usage,
 )
+from uyuni_ai_agent.tools.network_tools import check_connectivity, get_listening_ports
+from uyuni_ai_agent.tools.postgres_tools import (
+    get_postgres_active_queries,
+    get_postgres_connections,
+    get_postgres_health,
+    get_postgres_locks,
+    get_postgres_log,
+)
+from uyuni_ai_agent.tools.process_tools import (
+    get_cpu_pressure_snapshot,
+    get_memory_pressure_snapshot,
+    get_top_cpu_processes,
+    get_top_memory_processes,
+)
 from uyuni_ai_agent.tools.service_tools import (
     get_service_details,
     get_service_logs,
     get_service_status,
-)
-from uyuni_ai_agent.tools.network_tools import check_connectivity, get_listening_ports
-from uyuni_ai_agent.tools.apache_tools import (
-    get_apache_overload_snapshot,
-    get_apache_status,
-    get_apache_error_log,
-    get_apache_access_log,
-    get_apache_config_check,
-)
-from uyuni_ai_agent.tools.postgres_tools import (
-    get_postgres_active_queries, get_postgres_locks,
-    get_postgres_connections, get_postgres_health, get_postgres_log,
 )
 
 logger = logging.getLogger(__name__)
@@ -152,7 +156,7 @@ def load_prompt(template_name, **kwargs):
         "prompts"
     )
     template_path = os.path.join(prompts_dir, template_name)
-    with open(template_path, "r", encoding="utf-8") as f:
+    with open(template_path, encoding="utf-8") as f:
         template = f.read()
     return template.format(**kwargs)
 
@@ -401,7 +405,9 @@ async def collect_required_disk_evidence(anomaly):
             )
             for service in candidates
         ))
-        for service, (details, logs) in zip(candidates, inspections):
+        for service, (details, logs) in zip(
+            candidates, inspections, strict=True
+        ):
             _add_salt_evidence(
                 ledger,
                 check=f"service_details:{service}",
@@ -684,7 +690,19 @@ def append_required_evidence(prompt, evidence):
     )
 
 
-def _telemetry_unavailable_analysis(anomaly, ledger):
+def _quality_options(config):
+    quality = config.get("quality_gates", {}) if isinstance(config, dict) else {}
+    return {
+        "max_evidence_age_seconds": quality.get(
+            "max_evidence_age_seconds", 300
+        ),
+        "minimum_supporting_records": quality.get(
+            "minimum_supporting_records", 1
+        ),
+    }
+
+
+def _telemetry_unavailable_analysis(anomaly, ledger, config):
     failed = [
         record for record in ledger.records
         if record.status is not EvidenceStatus.OK
@@ -723,7 +741,12 @@ def _telemetry_unavailable_analysis(anomaly, ledger):
         urgency=Urgency.MEDIUM,
         confidence=1.0,
     )
-    return ground_analysis(analysis, ledger, allow_failed_evidence=True)
+    return ground_analysis(
+        analysis,
+        ledger,
+        allow_failed_evidence=True,
+        **_quality_options(config),
+    )
 
 
 async def investigate(anomaly, metrics, config):
@@ -746,7 +769,25 @@ async def investigate(anomaly, metrics, config):
     """
     required_evidence = await collect_required_evidence(anomaly)
     if anomaly.metric_name == "telemetry_unavailable":
-        return _telemetry_unavailable_analysis(anomaly, required_evidence)
+        return _telemetry_unavailable_analysis(
+            anomaly, required_evidence, config
+        )
+
+    quality = config.get("quality_gates", {}) if isinstance(config, dict) else {}
+    if quality.get("deterministic_analysis_enabled", True):
+        deterministic = try_deterministic_analysis(
+            anomaly, required_evidence
+        )
+        if deterministic is not None:
+            logger.info(
+                "Deterministic evidence gate resolved metric=%s without LLM",
+                anomaly.metric_name,
+            )
+            return ground_analysis(
+                deterministic,
+                required_evidence,
+                **_quality_options(config),
+            )
 
     # Load system and scenario-specific prompts only for LLM investigations.
     system_prompt = load_prompt("system_prompt.md")
@@ -806,7 +847,11 @@ async def investigate(anomaly, metrics, config):
         ),
         ("human", structuring_prompt),
     ])
-    return ground_analysis(analysis, required_evidence)
+    return ground_analysis(
+        analysis,
+        required_evidence,
+        **_quality_options(config),
+    )
 
 
 def _extract_text(final_message):

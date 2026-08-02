@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from uyuni_ai_agent.anomaly_detector import AlertSeverity, Anomaly
 from uyuni_ai_agent.evidence import (
@@ -127,6 +128,65 @@ def test_failed_collection_forces_conservative_explanation():
     assert "[E1] Salt service log inspection failed" in result.root_cause
 
 
+def test_stale_supporting_evidence_cannot_confirm_a_root_cause():
+    ledger = EvidenceLedger("client")
+    record = ledger.add(
+        source="salt",
+        check="disk_usage",
+        status=EvidenceStatus.OK,
+        summary="Filesystem /var is full",
+    )
+    record.observed_at = datetime.now(UTC) - timedelta(minutes=10)
+
+    result = ground_analysis(
+        analysis(), ledger, max_evidence_age_seconds=60
+    )
+
+    assert result.conclusion is AnalysisConclusion.INCONCLUSIVE
+    assert "evidence is stale" in result.root_cause
+
+
+def test_explicitly_contradicted_support_is_downgraded():
+    ledger = EvidenceLedger("client")
+    ledger.add(
+        source="salt",
+        check="service_logs",
+        status=EvidenceStatus.OK,
+        summary="Service log reports a port collision",
+    )
+    ledger.add(
+        source="salt",
+        check="socket_snapshot",
+        status=EvidenceStatus.CONTRADICTORY,
+        summary="No process is listening on the expected port",
+        contradicts=["E1"],
+    )
+
+    result = ground_analysis(analysis(), ledger)
+
+    assert result.conclusion is AnalysisConclusion.INCONCLUSIVE
+    assert "contradicts [E1]" in result.root_cause
+
+
+def test_destructive_remediation_is_removed_even_when_evidence_is_valid():
+    ledger = EvidenceLedger("client")
+    ledger.add(
+        source="salt",
+        check="disk_usage",
+        status=EvidenceStatus.OK,
+        summary="Filesystem /var is full",
+    )
+    result = ground_analysis(analysis(remediation=[
+        "rm -rf /var/lib/application",
+        "Configure log rotation",
+    ]), ledger)
+
+    assert result.conclusion is AnalysisConclusion.CONFIRMED
+    assert all("rm -rf" not in step for step in result.remediation)
+    assert "Configure log rotation" in result.remediation
+    assert any("operator approval" in step for step in result.remediation)
+
+
 def test_telemetry_blind_spot_produces_deterministic_cited_analysis(monkeypatch):
     anomaly = Anomaly(
         minion_id="client2",
@@ -194,3 +254,95 @@ def test_salt_blind_spot_produces_source_specific_analysis(monkeypatch):
     assert result.conclusion is AnalysisConclusion.CONFIRMED
     assert "Salt cannot provide trustworthy inspection results" in result.root_cause
     assert result.supporting_evidence_ids == ["E2"]
+
+
+def test_proven_service_port_conflict_bypasses_the_llm(monkeypatch):
+    anomaly = Anomaly(
+        minion_id="client",
+        metric_name="service_down",
+        current_value=1,
+        threshold=1,
+        severity=AlertSeverity.CRITICAL,
+        description="my-web.service is failed",
+        service_name="my-web.service",
+    )
+
+    class FakeSalt:
+        async def service_details(self, *_args, **_kwargs):
+            return (
+                "ActiveState=failed\nResult=exit-code\n"
+                "ExecStart={ argv[]=/usr/bin/python3 -m http.server 9000; }"
+            )
+
+        async def service_logs(self, *_args, **_kwargs):
+            return "OSError: [Errno 98] Address already in use"
+
+        async def run_command(self, *_args, **_kwargs):
+            return (
+                'LISTEN 0 5 0.0.0.0:9000 0.0.0.0:* '
+                'users:(("python3",pid=123,fd=3))'
+            )
+
+    monkeypatch.setattr(
+        "uyuni_ai_agent.react_agent.salt_api.salt_client", FakeSalt()
+    )
+    monkeypatch.setattr(
+        "uyuni_ai_agent.react_agent.get_agent",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("proven port conflict must not call an LLM")
+        ),
+    )
+
+    result = asyncio.run(investigate(anomaly, {}, {}))
+
+    assert result.conclusion is AnalysisConclusion.CONFIRMED
+    assert "TCP port 9000" in result.root_cause
+    assert "python3" in result.root_cause
+    assert len(result.supporting_evidence_ids) == 3
+
+
+def test_proven_postgres_blocker_bypasses_the_llm(monkeypatch):
+    anomaly = Anomaly(
+        minion_id="client",
+        metric_name="postgres_blocked_transaction",
+        current_value=60,
+        threshold=30,
+        severity=AlertSeverity.CRITICAL,
+        description="PostgreSQL query has been blocked for 60 seconds",
+        service_name="postgresql",
+        context={
+            "database": "app",
+            "blocked_pids": [202],
+            "blocker_pids": [101],
+        },
+    )
+
+    class FakeSalt:
+        async def postgres_health(self, *_args, **_kwargs):
+            return '{"available": true, "database": "postgres"}'
+
+        async def postgres_blocking_activity(self, *_args, **_kwargs):
+            return (
+                '{"blocked_pid": 202, "blocker_pid": 101, '
+                '"blocker_state": "idle in transaction"}'
+            )
+
+        async def apache_overload_snapshot(self, *_args, **_kwargs):
+            return "Apache is accepting requests"
+
+    monkeypatch.setattr(
+        "uyuni_ai_agent.react_agent.salt_api.salt_client", FakeSalt()
+    )
+    monkeypatch.setattr(
+        "uyuni_ai_agent.react_agent.get_agent",
+        lambda _config: (_ for _ in ()).throw(
+            AssertionError("proven PostgreSQL blocker must not call an LLM")
+        ),
+    )
+
+    result = asyncio.run(investigate(anomaly, {}, {}))
+
+    assert result.conclusion is AnalysisConclusion.CONFIRMED
+    assert "accepting queries" in result.root_cause
+    assert "101" in result.root_cause
+    assert "restart PostgreSQL" not in " ".join(result.remediation)

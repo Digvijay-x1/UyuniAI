@@ -28,13 +28,12 @@ schema and should be avoided.
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import List
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class Urgency(str, Enum):
+class Urgency(StrEnum):
     """Operator-facing urgency, distinct from the raw Prometheus severity.
 
     Severity is threshold-derived (warning/critical); urgency is the agent's
@@ -48,7 +47,7 @@ class Urgency(str, Enum):
     CRITICAL = "Critical"
 
 
-class AnalysisConclusion(str, Enum):
+class AnalysisConclusion(StrEnum):
     """Whether the collected evidence proves a root cause."""
 
     CONFIRMED = "confirmed"
@@ -82,14 +81,14 @@ class RootCauseAnalysis(BaseModel):
             "cause must contain citations such as [E1] or [E2]."
         ),
     )
-    supporting_evidence_ids: List[str] = Field(
+    supporting_evidence_ids: list[str] = Field(
         default_factory=list,
         description=(
             "Evidence ledger IDs that directly support the conclusion, for "
             "example ['E1', 'E3']. Do not invent IDs."
         ),
     )
-    key_evidence: List[str] = Field(
+    key_evidence: list[str] = Field(
         default_factory=list,
         description=(
             "2-3 concrete data points that support the root cause. Every item "
@@ -97,7 +96,7 @@ class RootCauseAnalysis(BaseModel):
             "/var at 98%'."
         ),
     )
-    remediation: List[str] = Field(
+    remediation: list[str] = Field(
         default_factory=list,
         description=(
             "Ordered, concrete remediation steps an operator can take. Most "

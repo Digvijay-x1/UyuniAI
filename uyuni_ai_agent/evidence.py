@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
 import json
 import re
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -27,11 +27,12 @@ from pydantic import BaseModel, Field
 from uyuni_ai_agent.models import AnalysisConclusion, RootCauseAnalysis
 
 
-class EvidenceStatus(str, Enum):
+class EvidenceStatus(StrEnum):
     OK = "ok"
     MISSING = "missing"
     STALE = "stale"
     ERROR = "error"
+    CONTRADICTORY = "contradictory"
 
 
 class EvidenceRecord(BaseModel):
@@ -45,8 +46,9 @@ class EvidenceRecord(BaseModel):
     summary: str
     details: str = ""
     observed_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
+        default_factory=lambda: datetime.now(UTC)
     )
+    contradicts: list[str] = Field(default_factory=list)
 
 
 def evidence_status_for(value: Any) -> EvidenceStatus:
@@ -84,6 +86,7 @@ class EvidenceLedger:
         details: Any = "",
         target: str | None = None,
         detail_limit: int = 12_000,
+        contradicts: list[str] | None = None,
     ) -> EvidenceRecord:
         if isinstance(details, str):
             rendered = details
@@ -99,6 +102,7 @@ class EvidenceLedger:
             status=status,
             summary=summary,
             details=rendered,
+            contradicts=list(contradicts or []),
         )
         self.records.append(record)
         return record
@@ -139,6 +143,9 @@ def ground_analysis(
     ledger: EvidenceLedger,
     *,
     allow_failed_evidence: bool = False,
+    max_evidence_age_seconds: float = 300,
+    minimum_supporting_records: int = 1,
+    now: datetime | None = None,
 ) -> RootCauseAnalysis:
     """Reject unsupported LLM conclusions and retain only cited evidence.
 
@@ -163,6 +170,25 @@ def ground_analysis(
     supporting_records = [
         ledger.get(evidence_id) for evidence_id in supporting
     ]
+    observed_now = now or datetime.now(UTC)
+    if observed_now.tzinfo is None:
+        observed_now = observed_now.replace(tzinfo=UTC)
+    stale_support = []
+    for record in supporting_records:
+        if record is None:
+            continue
+        observed_at = record.observed_at
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        age = (observed_now - observed_at).total_seconds()
+        if age < 0 or age > max_evidence_age_seconds:
+            stale_support.append(record.id)
+    contradicted_support = {
+        evidence_id
+        for record in ledger.records
+        for evidence_id in record.contradicts
+        if evidence_id in supporting_set
+    }
     statuses_are_usable = allow_failed_evidence or all(
         record is not None and record.status is EvidenceStatus.OK
         for record in supporting_records
@@ -174,12 +200,18 @@ def ground_analysis(
         and root_refs <= supporting_set
         and bool(grounded_bullets)
         and statuses_are_usable
+        and len(supporting) >= max(1, int(minimum_supporting_records))
+        and not stale_support
+        and not contradicted_support
     )
     if confirmed:
         return analysis.model_copy(
             update={
                 "supporting_evidence_ids": supporting,
                 "key_evidence": grounded_bullets[:3],
+                "remediation": _sanitize_remediation(
+                    analysis.remediation, inconclusive=False
+                ),
             }
         )
 
@@ -187,11 +219,23 @@ def ground_analysis(
         record for record in ledger.records
         if record.status is not EvidenceStatus.OK
     ]
-    reason = (
-        "; ".join(
-            f"[{record.id}] {record.summary}" for record in failed_records[:3]
+    reasons = [
+        f"[{record.id}] {record.summary}" for record in failed_records[:3]
+    ]
+    if stale_support:
+        reasons.append(
+            "supporting evidence is stale: "
+            + ", ".join(f"[{item}]" for item in stale_support)
         )
-        or "the proposed cause did not cite the collected evidence"
+    if contradicted_support:
+        reasons.append(
+            "collected evidence contradicts "
+            + ", ".join(f"[{item}]" for item in sorted(contradicted_support))
+        )
+    if len(supporting) < max(1, int(minimum_supporting_records)):
+        reasons.append("too few independent supporting records were cited")
+    reason = "; ".join(reasons) or (
+        "the proposed cause did not cite the collected evidence"
     )
     fallback_evidence = [
         f"[{record.id}] {record.summary}"
@@ -208,6 +252,37 @@ def ground_analysis(
                 record.id for record in (failed_records or ledger.records)[:3]
             ],
             "key_evidence": fallback_evidence,
+            "remediation": _sanitize_remediation(
+                analysis.remediation, inconclusive=True
+            ),
             "confidence": min(analysis.confidence, 0.3),
         }
     )
+
+
+_HIGH_RISK_REMEDIATION = re.compile(
+    r"(?i)(?:\brm\s+-rf\b|\bkill\s+-9\b|\bmkfs(?:\.|\s)|"
+    r"\bdd\s+if=|\bdrop\s+(?:database|table)\b|\btruncate\s+table\b|"
+    r"\b(?:reboot|shutdown)\b)"
+)
+
+
+def _sanitize_remediation(steps: list[str], *, inconclusive: bool) -> list[str]:
+    """Remove destructive suggestions and avoid action on unproven causes."""
+    safe = [
+        step.strip()
+        for step in steps
+        if step.strip() and not _HIGH_RISK_REMEDIATION.search(step)
+    ]
+    if inconclusive:
+        return [
+            "Restore or refresh the missing evidence and repeat the investigation.",
+            "Have an operator validate the affected component before changing service state or data.",
+        ]
+    if len(safe) != len([step for step in steps if step.strip()]):
+        safe.append(
+            "Escalate destructive recovery actions for explicit operator approval."
+        )
+    return safe or [
+        "Have an operator validate a safe remediation from the cited evidence."
+    ]

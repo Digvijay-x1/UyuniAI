@@ -1,4 +1,4 @@
-from uyuni_ai_agent.anomaly_detector import Anomaly, AlertSeverity
+from uyuni_ai_agent.anomaly_detector import AlertSeverity, Anomaly
 from uyuni_ai_agent.react_agent import get_prompt_for_anomaly
 
 
