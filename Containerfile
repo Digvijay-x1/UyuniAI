@@ -14,6 +14,10 @@ COPY uyuni_ai_agent/ uyuni_ai_agent/
 COPY prompts/ prompts/
 COPY config/ config/
 
+# Runtime incident state. Mount a named volume here to retain it when the
+# container is replaced during an upgrade.
+RUN mkdir -p /var/lib/uyuni-ai-agent
+
 # LLM_API_KEY should be passed as an env variable at runtime
 ENV LLM_API_KEY=""
 
