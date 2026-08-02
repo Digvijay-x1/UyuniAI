@@ -1,5 +1,8 @@
 prometheus:
   url: "http://52.91.91.80:9090"
+  # A successful query can still return an old sample after scrape failures.
+  # Never use samples older than this for anomaly detection.
+  max_sample_age_seconds: 300
 
 alertmanager:
   url: "http://52.91.91.80:9093"
@@ -93,6 +96,24 @@ postgres_lock_monitoring:
 deduplication:
   # Re-investigate a continuously failing unit only after this interval.
   cooldown_seconds: 900
+
+# Durable lifecycle state survives process restarts. Dry-run mode uses the
+# same path with a .dry-run suffix so evaluation cannot suppress real alerts.
+incident_store:
+  path: "/var/lib/uyuni-ai-agent/incidents.db"
+  # Require consecutive healthy observations before sending a resolution.
+  resolve_after_healthy_cycles: 2
+
+# Detection continues while a bounded worker pool investigates incidents.
+# Critical incidents can displace lower-priority pending work; displaced or
+# rejected incidents remain unacknowledged and are retried by the next poll.
+investigation_queue:
+  max_pending: 50
+  workers: 3
+  # Do not investigate a snapshot that sat in a backlog for too long.
+  max_job_age_seconds: 300
+  # Drain briefly on shutdown; unfinished incidents retry after restart.
+  shutdown_grace_seconds: 30
 
 concurrency:
   max_minions: 8       # minions processed in parallel per cycle

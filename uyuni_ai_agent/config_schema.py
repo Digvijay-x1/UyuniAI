@@ -44,6 +44,10 @@ class _HttpEndpoint(_StrictModel):
         return value
 
 
+class PrometheusSettings(_HttpEndpoint):
+    max_sample_age_seconds: float = Field(default=300, gt=0)
+
+
 class SaltAPISettings(_HttpEndpoint):
     username: str = Field(min_length=1)
     password: str = ""
@@ -143,6 +147,20 @@ class DeduplicationSettings(_StrictModel):
     cooldown_seconds: int = Field(ge=0)
 
 
+class IncidentStoreSettings(_StrictModel):
+    path: str = Field(
+        default="/var/lib/uyuni-ai-agent/incidents.db", min_length=1
+    )
+    resolve_after_healthy_cycles: int = Field(default=2, ge=1)
+
+
+class InvestigationQueueSettings(_StrictModel):
+    max_pending: int = Field(default=50, ge=1)
+    workers: int = Field(default=3, ge=1)
+    max_job_age_seconds: float = Field(default=300, gt=0)
+    shutdown_grace_seconds: float = Field(default=30, ge=0)
+
+
 class ConcurrencySettings(_StrictModel):
     max_minions: int = Field(gt=0)
     max_salt_calls: int = Field(gt=0)
@@ -160,7 +178,7 @@ class DependencyCorrelationSettings(_StrictModel):
 
 
 class Settings(_StrictModel):
-    prometheus: _HttpEndpoint
+    prometheus: PrometheusSettings
     alertmanager: _HttpEndpoint
     salt_api: SaltAPISettings
     minions: list[MinionSettings] = Field(min_length=1)
@@ -178,6 +196,12 @@ class Settings(_StrictModel):
         default_factory=PostgresLockMonitoringSettings
     )
     deduplication: DeduplicationSettings
+    incident_store: IncidentStoreSettings = Field(
+        default_factory=IncidentStoreSettings
+    )
+    investigation_queue: InvestigationQueueSettings = Field(
+        default_factory=InvestigationQueueSettings
+    )
     concurrency: ConcurrencySettings
 
     @model_validator(mode="after")

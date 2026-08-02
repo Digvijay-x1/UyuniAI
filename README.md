@@ -32,6 +32,12 @@ The agent runs as a sidecar Podman container alongside the Uyuni server. Every 6
    largest-RSS process. Swap occupancy alone is not labeled as active
    thrashing, and process arguments are omitted from LLM evidence.
 4. **Reports** -- the analysis gets sent to AlertManager, which can forward it to Slack or wherever your alerts go.
+   Incident state is stored in SQLite, so agent restarts do not repeat every
+   active alert. After two healthy observations, the agent sends an explicit
+   Alertmanager resolution with the exact label identity of the firing alert.
+   Investigations run through a bounded priority queue: duplicate incidents
+   are coalesced, critical work can displace lower-priority pending work, and
+   overload never acknowledges an incident that was not actually processed.
 
 The agent communicates with Salt through Uyuni's built-in REST API
 (`rest_cherrypy`) on port 9080. The Salt external-auth account needs access to
@@ -51,6 +57,16 @@ service_monitoring:
 
 deduplication:
   cooldown_seconds: 900
+
+incident_store:
+  path: /var/lib/uyuni-ai-agent/incidents.db
+  resolve_after_healthy_cycles: 2
+
+investigation_queue:
+  max_pending: 50
+  workers: 3
+  max_job_age_seconds: 300
+  shutdown_grace_seconds: 30
 ```
 
 ## Setup
@@ -62,7 +78,11 @@ Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertM
 
 podman build -t uyuni-ai-agent -f Containerfile .
 # Remove --dry-run to send real alerts to AlertManager; also, the project assumes that you have a "agent" name in the config of salt-api and you are putting its password
-podman run -d --name ai-agent --network=container:uyuni-server -e LLM_API_KEY="your_key" -e SALT_API_PASSWORD="your_salt_password" uyuni-ai-agent --dry-run
+podman volume create uyuni-ai-agent-state
+podman run -d --name ai-agent --network=container:uyuni-server \
+  -v uyuni-ai-agent-state:/var/lib/uyuni-ai-agent \
+  -e LLM_API_KEY="your_key" -e SALT_API_PASSWORD="your_salt_password" \
+  uyuni-ai-agent --dry-run
 
 ```
 

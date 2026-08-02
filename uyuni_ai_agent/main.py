@@ -17,11 +17,18 @@ import argparse
 import os
 import asyncio
 import signal
+import time
+from dataclasses import dataclass
 
 import httpx
 
 from uyuni_ai_agent.config import load_config
-from uyuni_ai_agent.deduplication import AnomalyDeduplicator
+from uyuni_ai_agent.incident_store import IncidentStore
+from uyuni_ai_agent.investigation_queue import (
+    CancelStatus,
+    EnqueueStatus,
+    InvestigationQueue,
+)
 from uyuni_ai_agent.logging_config import setup_logging
 from uyuni_ai_agent.prometheus_client import get_all_metrics
 from uyuni_ai_agent.anomaly_detector import (
@@ -31,10 +38,29 @@ from uyuni_ai_agent.anomaly_detector import (
     DependencyCorrelationWindow,
 )
 from uyuni_ai_agent.react_agent import investigate
-from uyuni_ai_agent.alert_manager import send_to_alertmanager
+from uyuni_ai_agent.alert_manager import (
+    alert_delivery_succeeded,
+    build_alert_payload,
+    build_resolved_payload,
+    send_alert_payload,
+)
 from uyuni_ai_agent.salt_api import SaltAPIClient, set_salt_client
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class InvestigationWork:
+    firing: object
+    metrics: dict
+    detected_at: float
+
+
+def _metric_text(value, suffix="%"):
+    """Render absent telemetry honestly in operator logs."""
+    if value is None:
+        return "unavailable"
+    return f"{float(value):.1f}{suffix}"
 
 
 async def detect_minion(
@@ -68,30 +94,44 @@ async def detect_minion(
                 )
                 logger.info(
                     (
-                        "Metrics: mem=%.1f%%, swap=%.1f%%, "
-                        "swap_activity=%.1f pages/s, cpu=%.1f%%, disk=%.1f%%"
+                        "Metrics: mem=%s, swap=%s, "
+                        "swap_activity=%s, cpu=%s, disk=%s"
                     ),
-                    metrics['memory_percent'],
-                    metrics.get("memory_pressure", {}).get(
-                        "swap_usage_percent", 0
+                    _metric_text(metrics["memory_percent"]),
+                    _metric_text(
+                        metrics.get("memory_pressure", {}).get(
+                            "swap_usage_percent"
+                        )
                     ),
-                    metrics.get("memory_pressure", {}).get(
-                        "swap_activity_pages_per_second", 0
+                    _metric_text(
+                        metrics.get("memory_pressure", {}).get(
+                            "swap_activity_pages_per_second"
+                        ),
+                        " pages/s",
                     ),
-                    metrics['cpu_percent'],
-                    metrics['disk_percent'],
+                    _metric_text(metrics["cpu_percent"]),
+                    _metric_text(metrics["disk_percent"]),
                 )
                 if apache_instance:
                     logger.info(
-                        "Apache: busy_workers=%.1f%%, req/s=%.1f",
-                        metrics.get('apache_busy_workers_percent', 0),
-                        metrics.get('apache_requests_per_sec', 0),
+                        "Apache: busy_workers=%s, req/s=%s",
+                        _metric_text(
+                            metrics.get("apache_busy_workers_percent")
+                        ),
+                        _metric_text(
+                            metrics.get("apache_requests_per_sec"), ""
+                        ),
                     )
                 if postgres_instance:
                     logger.info(
-                        "PostgreSQL: connections=%.1f%%, deadlocks/min=%.1f",
-                        metrics.get('postgres_active_connections_percent', 0),
-                        metrics.get('postgres_deadlocks_per_min', 0),
+                        "PostgreSQL: connections=%s, deadlocks/min=%s",
+                        _metric_text(
+                            metrics.get("postgres_active_connections_percent")
+                        ),
+                        _metric_text(
+                            metrics.get("postgres_deadlocks_per_min"),
+                            "",
+                        ),
                     )
             except Exception as e:
                 logger.error("Prometheus query failed: %s", e, exc_info=True)
@@ -152,16 +192,143 @@ async def detect_minion(
         return None
 
 
+async def process_firing_investigation(
+    work,
+    http_client,
+    config,
+    dry_run,
+    llm_sem,
+    incident_store,
+    max_job_age_seconds,
+):
+    """Investigate and deliver one queued incident when it is still current."""
+    firing = work.firing
+    anomaly = firing.anomaly
+    age = time.time() - work.detected_at
+    if age > max_job_age_seconds:
+        logger.warning(
+            "Skipping stale investigation %s (age %.0fs > %.0fs); a fresh "
+            "poll can enqueue it again.",
+            firing.fingerprint,
+            age,
+            max_job_age_seconds,
+        )
+        return
+    if not incident_store.is_actionable(
+        firing.fingerprint, firing.starts_at
+    ):
+        logger.info(
+            "Skipping investigation %s because that incident generation is "
+            "no longer active.",
+            firing.fingerprint,
+        )
+        return
+
+    logger.warning(
+        "INVESTIGATING: %s [%s] incident=%s",
+        anomaly.description,
+        anomaly.severity.value,
+        firing.fingerprint,
+    )
+    analysis = None
+    try:
+        async with llm_sem:
+            analysis = await investigate(anomaly, work.metrics, config)
+        logger.info("Analysis:\n%s", analysis.to_text())
+    except Exception as e:
+        logger.error("ReAct agent failed: %s", e, exc_info=True)
+
+    if analysis is None:
+        logger.error(
+            "Skipping alert for %s: investigation produced no analysis.",
+            anomaly.description,
+        )
+        return
+    if not incident_store.is_actionable(
+        firing.fingerprint, firing.starts_at
+    ):
+        logger.info(
+            "Discarding completed investigation %s because the incident "
+            "recovered or was replaced while evidence was collected.",
+            firing.fingerprint,
+        )
+        return
+
+    payload = build_alert_payload(
+        analysis,
+        severity=anomaly.severity.value,
+        minion_id=anomaly.minion_id,
+        metric_name=anomaly.metric_name,
+        service_name=anomaly.service_name or "",
+        resource=anomaly.resource or "",
+        incident_id=firing.fingerprint,
+        starts_at=firing.starts_at,
+    )
+
+    # Severity is a routing label in Alertmanager. Resolve the prior label
+    # set before emitting an escalation with a new label set.
+    previous_payload = firing.previous_payload
+    labels_changed = (
+        previous_payload is not None
+        and previous_payload.get("labels") != payload.get("labels")
+    )
+    if labels_changed and not dry_run:
+        transition_result = await send_alert_payload(
+            http_client,
+            config,
+            build_resolved_payload(previous_payload),
+        )
+        logger.info(
+            "AlertManager label-transition resolution: %s",
+            transition_result,
+        )
+        if not alert_delivery_succeeded(transition_result):
+            logger.error(
+                "Skipping replacement alert for %s because its prior "
+                "Alertmanager identity could not be resolved.",
+                firing.fingerprint,
+            )
+            return
+        if not incident_store.is_actionable(
+            firing.fingerprint, firing.starts_at
+        ):
+            logger.info(
+                "Skipping replacement alert %s because it recovered during "
+                "the label transition.",
+                firing.fingerprint,
+            )
+            return
+
+    if dry_run:
+        logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
+        logger.info("[DRY RUN] Analysis:\n%s", analysis.to_text())
+        incident_store.mark_emitted(
+            firing.fingerprint,
+            payload,
+            starts_at=firing.starts_at,
+        )
+    else:
+        logger.debug("Step 4: sending to AlertManager...")
+        result = await send_alert_payload(http_client, config, payload)
+        logger.info("AlertManager: %s", result)
+        if alert_delivery_succeeded(result):
+            incident_store.mark_emitted(
+                firing.fingerprint,
+                payload,
+                starts_at=firing.starts_at,
+            )
+
+
 async def process_minion_anomalies(
     snapshot,
     all_cycle_anomalies,
     http_client,
     config,
     dry_run,
-    llm_sem,
-    deduplicator,
+    incident_store,
+    investigation_queue,
 ):
-    """Investigate and alert for one minion after global correlation."""
+    """Reconcile one minion and queue only actionable firing work."""
     minion_id = snapshot["minion"]["id"]
     metrics = snapshot["metrics"]
     detected_anomalies = [
@@ -171,7 +338,46 @@ async def process_minion_anomalies(
     ]
 
     try:
-        anomalies = deduplicator.filter(minion_id, detected_anomalies)
+        changes = incident_store.reconcile(minion_id, detected_anomalies)
+
+        for incident in changes.resolved:
+            cancel_status = await investigation_queue.cancel(
+                incident.fingerprint
+            )
+            if cancel_status is CancelStatus.IN_FLIGHT:
+                logger.info(
+                    "Deferring resolution for incident %s until its in-flight "
+                    "investigation finishes.",
+                    incident.fingerprint,
+                )
+                continue
+            if incident.payload is None:
+                incident_store.mark_resolved(incident.fingerprint)
+                logger.info(
+                    "RESOLVED locally: %s/%s had no delivered firing alert.",
+                    incident.minion_id,
+                    incident.metric_name,
+                )
+                continue
+
+            resolved_payload = build_resolved_payload(incident.payload)
+            if dry_run:
+                logger.info(
+                    "[DRY RUN] Would resolve incident %s: %s/%s",
+                    incident.fingerprint,
+                    incident.minion_id,
+                    incident.metric_name,
+                )
+                incident_store.mark_resolved(incident.fingerprint)
+                continue
+
+            result = await send_alert_payload(
+                http_client, config, resolved_payload
+            )
+            logger.info("AlertManager resolution: %s", result)
+            if alert_delivery_succeeded(result):
+                incident_store.mark_resolved(incident.fingerprint)
+
         if not detected_anomalies:
             logger.info(
                 "%s: all metrics, systemd services, and PostgreSQL locks "
@@ -179,7 +385,7 @@ async def process_minion_anomalies(
                 minion_id,
             )
             return
-        if not anomalies:
+        if not changes.firing:
             logger.info(
                 "%s: detected anomalies are unchanged and inside the "
                 "deduplication cooldown.",
@@ -187,41 +393,55 @@ async def process_minion_anomalies(
             )
             return
 
-        for anomaly in anomalies:
-            logger.warning(
-                "ANOMALY: %s [%s]", anomaly.description, anomaly.severity.value
+        for firing in changes.firing:
+            anomaly = firing.anomaly
+            enqueue_result = await investigation_queue.enqueue(
+                firing.fingerprint,
+                anomaly.severity,
+                InvestigationWork(
+                    firing=firing,
+                    metrics=metrics,
+                    detected_at=time.time(),
+                ),
             )
-
-            logger.debug("Step 3: running ReAct agent...")
-            analysis = None
-            try:
-                async with llm_sem:
-                    analysis = await investigate(anomaly, metrics, config)
-                logger.info("Analysis:\n%s", analysis.to_text())
-            except Exception as e:
-                logger.error("ReAct agent failed: %s", e, exc_info=True)
-
-            if analysis is None:
-                logger.error(
-                    "Skipping alert for %s: investigation produced no analysis.",
+            if enqueue_result.status is EnqueueStatus.ENQUEUED:
+                logger.warning(
+                    "ANOMALY queued: %s [%s] incident=%s pending=%d",
                     anomaly.description,
+                    anomaly.severity.value,
+                    firing.fingerprint,
+                    enqueue_result.pending,
                 )
-            elif dry_run:
-                logger.info("[DRY RUN] Would send alert: %s", anomaly.description)
-                logger.info("[DRY RUN] Analysis:\n%s", analysis.to_text())
+                if enqueue_result.evicted_fingerprint:
+                    logger.warning(
+                        "Investigation queue evicted lower-priority incident "
+                        "%s for critical incident %s; it remains unacknowledged "
+                        "and will retry on a later poll.",
+                        enqueue_result.evicted_fingerprint,
+                        firing.fingerprint,
+                    )
+            elif enqueue_result.status is EnqueueStatus.COALESCED:
+                logger.info(
+                    "Refreshed pending investigation %s with the newest "
+                    "snapshot (pending=%d).",
+                    firing.fingerprint,
+                    enqueue_result.pending,
+                )
+            elif enqueue_result.status is EnqueueStatus.IN_FLIGHT:
+                logger.debug(
+                    "Incident %s is already being investigated.",
+                    firing.fingerprint,
+                )
             else:
-                logger.debug("Step 4: sending to AlertManager...")
-                result = await send_to_alertmanager(
-                    http_client,
-                    config,
-                    analysis,
-                    severity=anomaly.severity.value,
-                    minion_id=anomaly.minion_id,
-                    metric_name=anomaly.metric_name,
-                    service_name=anomaly.service_name or "",
-                    resource=anomaly.resource or "",
+                logger.warning(
+                    "Investigation backpressure: incident %s was not queued "
+                    "(%s, pending=%d, in_flight=%d). It remains "
+                    "unacknowledged and will retry on the next poll.",
+                    firing.fingerprint,
+                    enqueue_result.status.value,
+                    enqueue_result.pending,
+                    enqueue_result.in_flight,
                 )
-                logger.info("AlertManager: %s", result)
     except Exception as e:
         logger.error(
             "Minion %s investigation failed: %s",
@@ -257,11 +477,29 @@ async def run(dry_run=False):
     concurrency_cfg = config.get("concurrency", {})
     max_minions = concurrency_cfg.get("max_minions", 8)
     max_llm_calls = concurrency_cfg.get("max_llm_calls", 5)
+    queue_cfg = config.get("investigation_queue", {})
+    max_job_age_seconds = queue_cfg.get("max_job_age_seconds", 300)
 
     minion_sem = asyncio.Semaphore(max_minions)
     llm_sem = asyncio.Semaphore(max_llm_calls)
-    deduplicator = AnomalyDeduplicator(
-        config.get("deduplication", {}).get("cooldown_seconds", 900)
+    incident_cfg = config.get("incident_store", {})
+    state_path = incident_cfg.get(
+        "path", "/var/lib/uyuni-ai-agent/incidents.db"
+    )
+    if dry_run and state_path != ":memory:":
+        state_path = f"{state_path}.dry-run"
+    incident_store = IncidentStore(
+        state_path,
+        cooldown_seconds=config.get("deduplication", {}).get(
+            "cooldown_seconds", 900
+        ),
+        resolve_after_healthy_cycles=incident_cfg.get(
+            "resolve_after_healthy_cycles", 2
+        ),
+    )
+    investigation_queue = InvestigationQueue(
+        max_pending=queue_cfg.get("max_pending", 50),
+        workers=queue_cfg.get("workers", 3),
     )
     correlation_cfg = config.get("dependency_correlation", {})
     apache_traffic_threshold = (
@@ -286,6 +524,17 @@ async def run(dry_run=False):
     set_salt_client(salt)
     try:
         await salt.start()
+        await investigation_queue.start(
+            lambda work: process_firing_investigation(
+                work,
+                http_client,
+                config,
+                dry_run,
+                llm_sem,
+                incident_store,
+                max_job_age_seconds,
+            )
+        )
         while not stop.is_set():
             snapshots = await asyncio.gather(*(
                 detect_minion(
@@ -323,12 +572,22 @@ async def run(dry_run=False):
                     http_client,
                     config,
                     dry_run,
-                    llm_sem,
-                    deduplicator,
+                    incident_store,
+                    investigation_queue,
                 )
                 for snapshot in snapshots
             ))
 
+            queue_stats = investigation_queue.stats
+            logger.info(
+                "Investigation queue: pending=%d in_flight=%d completed=%d "
+                "rejected=%d evicted=%d",
+                queue_stats.pending,
+                queue_stats.in_flight,
+                queue_stats.completed,
+                queue_stats.rejected,
+                queue_stats.evicted,
+            )
             logger.info("Sleeping %ds...", interval)
             # Sleep for the interval, but wake promptly if asked to stop.
             try:
@@ -336,8 +595,19 @@ async def run(dry_run=False):
             except asyncio.TimeoutError:
                 pass  # interval elapsed normally; loop again
     finally:
+        shutdown = await investigation_queue.close(
+            queue_cfg.get("shutdown_grace_seconds", 30)
+        )
+        if not shutdown.drained:
+            logger.warning(
+                "Investigation shutdown grace expired with %d job(s) "
+                "unfinished; durable incident state will retry them after "
+                "restart.",
+                shutdown.abandoned,
+            )
         await http_client.aclose()
         await salt.aclose()
+        incident_store.close()
         logger.info("AI Monitoring Agent stopped.")
 
 

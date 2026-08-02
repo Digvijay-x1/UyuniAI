@@ -76,6 +76,16 @@ def valid_config():
         "service_monitoring": {"enabled": True, "ignored_units": []},
         "postgres_lock_monitoring": {"enabled": True},
         "deduplication": {"cooldown_seconds": 900},
+        "incident_store": {
+            "path": "/var/lib/uyuni-ai-agent/incidents.db",
+            "resolve_after_healthy_cycles": 2,
+        },
+        "investigation_queue": {
+            "max_pending": 50,
+            "workers": 3,
+            "max_job_age_seconds": 300,
+            "shutdown_grace_seconds": 30,
+        },
         "concurrency": {
             "max_minions": 8,
             "max_salt_calls": 8,
@@ -116,6 +126,12 @@ def test_valid_config_is_normalized_and_preserves_dictionary_interface():
         (
             lambda config: config["concurrency"].update({"max_salt_calls": 0}),
             "greater than 0",
+        ),
+        (
+            lambda config: config["investigation_queue"].update(
+                {"max_pending": 0}
+            ),
+            "greater than or equal to 1",
         ),
     ],
 )
