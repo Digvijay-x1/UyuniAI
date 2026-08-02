@@ -1,0 +1,77 @@
+groups:
+  - name: uyuni-ai-agent-availability
+    interval: 30s
+    rules:
+      - alert: UyuniAIAgentTargetDown
+        expr: up{job="uyuni-ai-agent"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uyuni AI agent metrics target is unreachable"
+          description: "Prometheus has been unable to scrape the agent for two minutes."
+
+      - alert: UyuniAIAgentNotReady
+        expr: uyuni_ai_agent_ready{job="uyuni-ai-agent"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uyuni AI agent is alive but not ready"
+          description: "A required dependency is unavailable or no recent poll completed successfully."
+
+      - alert: UyuniAIAgentPollStalled
+        expr: time() - uyuni_ai_agent_last_successful_poll_timestamp_seconds{job="uyuni-ai-agent"} > 240
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uyuni AI agent polling has stalled"
+          description: "No complete successful minion poll has been recorded for more than four minutes."
+
+  - name: uyuni-ai-agent-degradation
+    interval: 30s
+    rules:
+      - alert: UyuniAIAgentDependencyCircuitOpen
+        expr: uyuni_ai_agent_dependency_circuit_state{job="uyuni-ai-agent",state="open"} == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uyuni AI agent dependency circuit is open"
+          description: "The {{ $labels.dependency }} dependency is rejecting calls after repeated failures."
+
+      - alert: UyuniAIAgentTimeouts
+        expr: increase(uyuni_ai_agent_timeouts_total{job="uyuni-ai-agent"}[10m]) > 2
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uyuni AI agent operations are timing out"
+          description: "The {{ $labels.scope }} scope exceeded its deadline more than twice in ten minutes."
+
+      - alert: UyuniAIAgentQueueBacklog
+        expr: uyuni_ai_agent_investigation_queue_pending{job="uyuni-ai-agent"} > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uyuni AI agent investigation queue is backlogged"
+          description: "More than ten investigations have remained queued for ten minutes."
+
+      - alert: UyuniAIAgentQueueSaturated
+        expr: uyuni_ai_agent_investigation_queue_pending{job="uyuni-ai-agent"} > 40
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uyuni AI agent investigation queue is near capacity"
+          description: "The bounded investigation queue is at least 80 percent full."
+
+      - alert: UyuniAIAgentAlertDeliveryFailures
+        expr: increase(uyuni_ai_agent_alertmanager_deliveries_total{job="uyuni-ai-agent",outcome="failure"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uyuni AI agent could not deliver an incident"
+          description: "At least one firing or resolved incident failed Alertmanager delivery."
+

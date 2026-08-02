@@ -1,0 +1,14 @@
+# Merge this job into Prometheus's scrape_configs after exposing TCP 9898 on
+# the Uyuni host only to the monitoring VM. Do not publish the port globally.
+scrape_configs:
+  - job_name: "uyuni-ai-agent"
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "139.59.3.229:9898"
+        labels:
+          service: "uyuni-ai-agent"
+          environment: "gsoc-lab"
+
