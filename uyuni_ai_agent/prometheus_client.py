@@ -306,9 +306,10 @@ async def get_target_health(
     client,
     prometheus_url,
     max_sample_age_seconds=300,
+    health_metric="up",
 ):
     return await _scalar_reading(
-        f'up{{instance="{instance}"}}',
+        f'{health_metric}{{instance="{instance}"}}',
         f"{exporter}_up",
         instance,
         exporter,
@@ -726,6 +727,7 @@ async def get_all_metrics(
             client,
             prometheus_url,
             max_age,
+            health_metric="apache_up",
         )
         busy = await get_apache_busy_workers_percent(
             apache_instance, client, prometheus_url, max_age
@@ -747,6 +749,7 @@ async def get_all_metrics(
             client,
             prometheus_url,
             max_age,
+            health_metric="pg_up",
         )
         connections = await get_postgres_active_connections_percent(
             postgres_instance, client, prometheus_url, max_age

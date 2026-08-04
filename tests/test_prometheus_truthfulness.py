@@ -7,6 +7,7 @@ from uyuni_ai_agent.anomaly_detector import check_all_metrics
 from uyuni_ai_agent.evidence import EvidenceStatus
 from uyuni_ai_agent.prometheus_client import (
     get_cpu_usage_percent,
+    get_target_health,
     query_prometheus,
 )
 
@@ -29,6 +30,7 @@ class FakeClient:
         self.error = error
 
     async def get(self, url, params, timeout):
+        self.last_params = params
         if self.error:
             raise self.error
         return self.response
@@ -186,3 +188,20 @@ def test_successful_numeric_zero_remains_usable():
 
     assert reading.status is EvidenceStatus.OK
     assert reading.value == 0.0
+
+
+def test_backend_health_can_use_exporter_specific_metric():
+    client = FakeClient(FakeResponse(200, payload([
+        {"metric": {}, "value": [time.time(), "1"]},
+    ])))
+
+    reading = asyncio.run(get_target_health(
+        "client:9187",
+        "postgres_exporter",
+        client,
+        "http://prometheus:9090",
+        health_metric="pg_up",
+    ))
+
+    assert reading.usable
+    assert client.last_params["query"] == 'pg_up{instance="client:9187"}'
