@@ -22,7 +22,7 @@
   expected_tools: [service_details, service_logs, listening_tcp_ports]
   expectation:
     conclusion: confirmed
-    component_pattern: "(?i)service|my-web"
+    component_pattern: "(?i)service"
     required_concept_groups:
       - ["address already in use", "port conflict", "already listening"]
       - ["tcp port", "listener"]

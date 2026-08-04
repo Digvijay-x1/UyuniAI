@@ -1,0 +1,26 @@
+[Unit]
+Description=Uyuni AI monitoring agent
+Wants=network-online.target uyuni-server.service
+After=network-online.target uyuni-server.service
+
+[Container]
+Image=localhost/uyuni-ai-agent:production
+ContainerName=ai-agent
+Network=uyuni
+PublishPort=127.0.0.1:19898:9898
+EnvironmentFile=/root/UyuniAI/.env
+Volume=/root/UyuniAI/config:/opt/uyuni-ai-agent/config:ro,Z
+Volume=uyuni-ai-agent-state:/var/lib/uyuni-ai-agent:Z
+Exec=--dry-run
+HealthCmd=/usr/local/bin/python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9898/healthz', timeout=3)"
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

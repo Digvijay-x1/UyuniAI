@@ -1,17 +1,7 @@
 #!/bin/sh
 set -eu
 
-container_ip=$(
-    /usr/bin/podman inspect \
-        --format '{{.NetworkSettings.Networks.uyuni.IPAddress}}' \
-        uyuni-server
-)
-
-case "$container_ip" in
-    ""|*[!0-9.]*)
-        echo "Could not resolve the Uyuni container IPv4 address" >&2
-        exit 1
-        ;;
-esac
-
-exec /usr/lib/systemd/systemd-socket-proxyd "${container_ip}:9898"
+# Quadlet publishes the container endpoint only on host loopback. Keeping this
+# proxy destination stable prevents container recreation from leaving a
+# long-running socket-proxyd process pinned to an obsolete bridge address.
+exec /usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:19898

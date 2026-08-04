@@ -1,8 +1,7 @@
 # Evaluation
 
-The evaluation catalog in `evaluation/scenarios.yaml` turns the mentor's
-requirements into reviewable pass/fail criteria. It includes baseline,
-correlation, root-cause-chain, and adversarial cases.
+The catalog in `evaluation/scenarios.yaml` defines repeatable pass/fail
+criteria for baseline, correlation, root-cause-chain, and adversarial cases.
 
 The catalog currently covers isolated CPU pressure, service port conflict,
 disk-filling crash loops, PostgreSQL blockers, memory swap thrashing, the
@@ -25,7 +24,7 @@ pytest -q -p no:cacheprovider
 ruff check .
 ```
 
-For a live evaluation, preserve these artifacts for each attempt:
+For live validation, retain these artifacts for each run:
 
 1. injection and cleanup timestamps;
 2. raw Prometheus alerts and samples;
@@ -34,11 +33,10 @@ For a live evaluation, preserve these artifacts for each attempt:
 5. the scenario score and each failed criterion;
 6. recovery metrics and the resolved incident.
 
-Do not score a test as successful merely because an alert appeared. The RCA
+An alert alone does not make a scenario successful. The RCA
 must name the causal component, cite fresh supporting records, avoid forbidden
 claims such as a blind database restart, and recommend action at the cause.
 
-Reproduction scripts remain local lab assets and are intentionally excluded
-from Git. Unit tests and the catalog remain in the repository because they are
-portable: they validate reasoning and safety contracts without requiring the
-three-VM lab.
+Fault injection is environment-specific and is not included in this
+repository. The catalog and unit tests validate the same reasoning and safety
+contracts without depending on a particular infrastructure topology.

@@ -1,38 +1,38 @@
 prometheus:
-  url: "http://52.91.91.80:9090"
+  url: "http://prometheus.example.com:9090"
   # A successful query can still return an old sample after scrape failures.
   # Never use samples older than this for anomaly detection.
   max_sample_age_seconds: 300
 
 alertmanager:
-  url: "http://52.91.91.80:9093"
+  url: "http://alertmanager.example.com:9093"
 
 salt_api:
-  url: "https://localhost:9080"
-  username: "agent"
+  url: "https://uyuni-server:9080"
+  username: "admin"
   password: ""  # set via SALT_API_PASSWORD env var
   eauth: "file"
 
 minions:
-  - id: "client"
-    instance: "client.digvijayrawat.me:9100"
-    apache_instance: "client.digvijayrawat.me:9117"
-    postgres_instance: "client.digvijayrawat.me:9187"
-  - id: "client2"
-    instance: "168.144.177.121:9100"
-    apache_instance: "168.144.177.121:9117"
-    postgres_instance: "168.144.177.121:9187"
+  - id: "database.example.com"
+    instance: "database.example.com:9100"
+    apache_instance: "database.example.com:9117"
+    postgres_instance: "database.example.com:9187"
+  - id: "web.example.com"
+    instance: "web.example.com:9100"
+    apache_instance: "web.example.com:9117"
+    postgres_instance: "web.example.com:9187"
 
 # Cross-minion correlation is topology-gated to prevent unrelated alerts from
 # different machines being merged solely because they happened at the same
-# time. These edges can later be generated from Uyuni groups or service tags.
+# time. Declare only dependencies that are known to carry production traffic.
 dependency_correlation:
   # Prometheus targets scrape independently. Hold a one-sided dependency
   # candidate briefly so adjacent cycles can form one incident.
   grace_seconds: 90
   postgres_apache:
-    - postgres_minion: "client"
-      apache_minion: "client2"
+    - postgres_minion: "database.example.com"
+      apache_minion: "web.example.com"
 
 thresholds:
   memory:
@@ -73,8 +73,8 @@ thresholds:
       critical: 30
 
 llm:
-  provider: "tokenrouter"  # "openai", "google_genai", or "huggingface"
-  model: "openai/gpt-oss-120b"
+  provider: "openai"  # "openai", "google_genai", "huggingface", or "tokenrouter"
+  model: "replace-with-model-id"
   # api_key loaded from env: LLM_API_KEY
 
 logging:

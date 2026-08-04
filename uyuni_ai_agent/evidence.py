@@ -149,9 +149,8 @@ def ground_analysis(
 ) -> RootCauseAnalysis:
     """Reject unsupported LLM conclusions and retain only cited evidence.
 
-    This is deliberately structural rather than semantic: the model must cite
-    an existing ledger record in both the conclusion and each evidence bullet.
-    A future claim verifier can additionally compare the prose to the record.
+    The model must cite an existing ledger record in both the conclusion and
+    each evidence bullet. Unsupported citations are discarded.
     """
     allowed = ledger.ids
     supporting = [

@@ -21,9 +21,8 @@ to AlertManager has stable, machine-readable fields (instead of one opaque text
 blob). The field layout mirrors the Slack-oriented format in
 ``prompts/system_prompt.md`` (Root Cause / Key Evidence / Remediation / Urgency).
 
-Only use an LLM/model that advertises native ``json_schema`` structured output
-(see ``structured-output-models.md``); JSON-mode-only models do not guarantee the
-schema and should be avoided.
+The configured model must support native ``json_schema`` structured output.
+JSON mode alone does not guarantee conformance to this schema.
 """
 
 from __future__ import annotations

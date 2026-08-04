@@ -21,21 +21,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Ref: https://prometheus.io/docs/alerting/latest/alerts_api/
-#      https://petstore.swagger.io/?url=https://raw.githubusercontent.com/prometheus/alertmanager/main/api/v2/openapi.yaml
+# Alertmanager v2 API schema:
+# https://raw.githubusercontent.com/prometheus/alertmanager/main/api/v2/openapi.yaml
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE_SECONDS = 0.5
 
 
 def _rfc3339_now() -> str:
-    """Return the current UTC time as an RFC3339 timestamp with a 'Z' suffix.
-
-    AlertManager's v2 API expects RFC3339. The previous implementation appended
-    a literal 'Z' to a timezone-naive ``isoformat()`` which produced a malformed
-    value; here we build a proper UTC timestamp and replace the ``+00:00`` offset
-    with ``Z``.
-    """
+    """Return the current UTC time as an RFC3339 timestamp with a ``Z`` suffix."""
     return (
         datetime.datetime.now(datetime.UTC)
         .isoformat(timespec="seconds")

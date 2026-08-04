@@ -1,6 +1,9 @@
 # AI-Powered Monitoring Agent for Uyuni
 
-This project is part of an ongoing effort to bring intelligent, automated monitoring to [Uyuni](https://www.uyuni-project.org/). The idea is straightforward: instead of manually investigating alerts, let an AI agent do the initial research -- pull metrics from Prometheus, figure out what's wrong using Salt, and report back with a root-cause analysis.
+This project provides evidence-driven incident investigation for
+[Uyuni](https://www.uyuni-project.org/). It detects anomalous telemetry in
+Prometheus, collects bounded diagnostic evidence through Salt, and reports a
+structured root-cause analysis.
 
 <img width="1147" height="712" alt="image" src="https://github.com/user-attachments/assets/d67caca9-f297-4109-830c-58156293ef01" />
 
@@ -8,7 +11,8 @@ This project is part of an ongoing effort to bring intelligent, automated monito
 
 ## How it works
 
-The agent runs as a sidecar Podman container alongside the Uyuni server. Every 60 seconds it:
+The agent runs as a separate Podman container on the Uyuni server's managed
+`uyuni` bridge. Every 60 seconds it:
 
 1. **Pulls metrics** from Prometheus (CPU, available memory, swap occupancy
    and page activity, and every writable persistent filesystem via PromQL).
@@ -31,7 +35,8 @@ The agent runs as a sidecar Podman container alongside the Uyuni server. Every 6
    page-in/page-out rates, system CPU/I/O wait, pressure stalls, and the
    largest-RSS process. Swap occupancy alone is not labeled as active
    thrashing, and process arguments are omitted from LLM evidence.
-4. **Reports** -- the analysis gets sent to AlertManager, which can forward it to Slack or wherever your alerts go.
+4. **Reports** -- the analysis is sent to Alertmanager for routing to configured
+   notification receivers.
    Incident state is stored in SQLite, so agent restarts do not repeat every
    active alert. After two healthy observations, the agent sends an explicit
    Alertmanager resolution with the exact label identity of the firing alert.
@@ -75,9 +80,10 @@ observability:
   readiness_max_age_seconds: 180
 ```
 
-The observability listener exposes three read-only endpoints inside the Uyuni
-server container's network namespace. Port 9898 is not published by the
-sidecar deployment command:
+The observability listener exposes three read-only endpoints inside the agent
+container. Production Quadlet publishes it only to host loopback on port
+19898; a source-restricted systemd socket proxy exposes port 9898 only to the
+monitoring host:
 
 - `/healthz` reports that the agent process and listener are alive.
 - `/readyz` returns HTTP 200 only after at least one recent, complete minion
@@ -88,9 +94,9 @@ sidecar deployment command:
   outcomes, and Python process metrics.
 
 These metrics intentionally exclude prompts, evidence text, commands, SQL,
-credentials, incident IDs, and resource names. With the sidecar network,
-verify them locally with
-`podman exec uyuni-server curl -fsS http://127.0.0.1:9898/metrics`.
+credentials, incident IDs, and resource names. Verify the loopback-only
+backend on the Uyuni host with
+`curl -fsS http://127.0.0.1:19898/metrics`.
 The production scrape and alert fragments are under `deploy/monitoring/`;
 expose the port only through a source-restricted proxy or private network.
 
@@ -111,28 +117,37 @@ insufficient.
 
 ## Setup
 
-Configuration lives in `config/settings.yaml` -- set your Prometheus URL, AlertManager URL, minion IDs, LLM provider (HuggingFace, Google Gemini, or OpenAI), and anomaly thresholds.
+Configuration lives in `config/settings.yaml` -- set your Prometheus URL,
+AlertManager URL, exact FQDN Salt minion IDs, OpenAI-compatible LLM endpoint,
+and anomaly thresholds. Uyuni, its managed clients, Prometheus, and
+Alertmanager are external prerequisites; this repository does not provision
+those systems.
 
 ```bash
 # Build the agent container
 
-podman build --format=docker -t uyuni-ai-agent -f Containerfile .
-# Remove --dry-run to send real alerts to AlertManager; also, the project assumes that you have a "agent" name in the config of salt-api and you are putting its password
-podman volume create uyuni-ai-agent-state
-podman run -d --name ai-agent --network=container:uyuni-server \
-  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  --cap-drop=all --security-opt=no-new-privileges \
-  --pids-limit=256 --memory=1g --cpus=2 \
-  -v uyuni-ai-agent-state:/var/lib/uyuni-ai-agent:U \
-  --env-file /root/UyuniAI/.env \
-  uyuni-ai-agent --dry-run
+podman build --format=docker \
+  -t localhost/uyuni-ai-agent:production -f Containerfile .
+sudo install -m 0644 deploy/agent/uyuni-ai-agent.container \
+  /etc/containers/systemd/uyuni-ai-agent.container
+sudo systemctl daemon-reload
+sudo systemctl enable --now uyuni-ai-agent.service
+
+# On the Uyuni host, expose agent metrics only to your monitoring server.
+sudo deploy/agent/install-metrics-proxy.sh MONITORING_SERVER_IP
+
+# On the monitoring server, add the agent scrape job and self-alert rules.
+sudo deploy/monitoring/install-agent-monitoring.sh UYUNI_HOSTNAME_OR_IP
 
 ```
 
-The image runs as UID/GID 10001. The `:U` volume option performs the one-time
-ownership adjustment needed by the non-root SQLite state store. Keep
-`--dry-run` until the complete detection, investigation, and Alertmanager route
-have been verified. See [Operations](docs/operations.md) and
+The image runs as UID/GID 10001, and the Quadlet uses a named volume for the
+non-root SQLite state store. Its checked-in definition stays in `--dry-run`
+until detection, investigation, and the Alertmanager route have been verified.
+Use `deploy/agent/sync-agent-salt-secret.sh` to install Uyuni's root-only
+internal Salt API credential into the agent environment without printing or
+committing it. See
+[Operations](docs/operations.md) and
 [Evaluation](docs/evaluation.md) for health checks, upgrades, rollback, and the
 scored scenario catalog.
 

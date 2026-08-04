@@ -9,7 +9,3 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/containers/storage
-ReadWritePaths=-/run/containers/storage
-ReadWritePaths=-/run/lock/netavark.lock
-ReadWritePaths=-/run/libpod

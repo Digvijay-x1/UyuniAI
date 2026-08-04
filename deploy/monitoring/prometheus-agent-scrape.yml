@@ -7,8 +7,7 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets:
-          - "139.59.3.229:9898"
+          - "UYUNI_AGENT_TARGET:9898"
         labels:
           service: "uyuni-ai-agent"
-          environment: "gsoc-lab"
-
+          environment: "production"

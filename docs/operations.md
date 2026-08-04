@@ -2,131 +2,118 @@
 
 ## Runtime contract
 
-The agent is a non-root sidecar in the `uyuni-server` network namespace. It
-reads Prometheus over HTTP, reaches Uyuni's Salt API at `localhost:9080`, calls
-the configured OpenAI-compatible LLM API, and writes only its SQLite incident
-state under `/var/lib/uyuni-ai-agent`.
+The agent runs as a non-root Podman container on the Uyuni-managed `uyuni`
+network. It reads telemetry from Prometheus, calls Uyuni's Salt REST API, sends
+incidents to Alertmanager, and stores incident state in a named volume mounted
+at `/var/lib/uyuni-ai-agent`.
 
-Required secrets are supplied at runtime:
+Runtime secrets belong in a root-readable environment file and must not be
+baked into the image or passed on the command line:
 
 - `LLM_API_KEY`
 - `SALT_API_PASSWORD`
-- `LANGSMITH_API_KEY` only when tracing is deliberately enabled
+- `LANGSMITH_API_KEY` when tracing is enabled
 
-Do not bake `.env` into the image or pass secret values directly on the command
-line. Restrict the env file to the account that manages Podman.
-
-The supported endpoint overrides are `SALT_API_URL`, `PROMETHEUS_URL`, and
-`ALERTMANAGER_URL`. They change destinations, not credentials, and are useful
-for recovery tests and promoting the same image between environments.
+`SALT_API_URL`, `PROMETHEUS_URL`, and `ALERTMANAGER_URL` override endpoint
+locations without changing the image. OpenAI-compatible deployments can set
+`OPENAI_API_BASE` in the same environment file.
 
 ## Deployment
 
-Build and retain a uniquely tagged image before replacing the container:
+Build the image and install the supplied Quadlet on the Uyuni container host:
 
 ```bash
-podman build --format=docker -t localhost/ai-agent:2026-08-production -f Containerfile .
-podman volume create uyuni-ai-agent-state
-podman run -d --name ai-agent-candidate \
-  --network=container:uyuni-server \
-  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-  --cap-drop=all --security-opt=no-new-privileges \
-  --pids-limit=256 --memory=1g --cpus=2 \
-  -v uyuni-ai-agent-state:/var/lib/uyuni-ai-agent:U \
-  --env-file /root/UyuniAI/.env \
-  localhost/ai-agent:2026-08-production --dry-run
+podman build --format=docker \
+  -t localhost/uyuni-ai-agent:production -f Containerfile .
+
+install -m 0644 deploy/agent/uyuni-ai-agent.container \
+  /etc/containers/systemd/uyuni-ai-agent.container
+deploy/agent/sync-agent-salt-secret.sh
+
+systemctl daemon-reload
+systemctl enable --now uyuni-ai-agent.service
 ```
 
-Only one agent can bind port 9898 in the shared network namespace, so stop the
-old container immediately before starting the candidate. Do not remove the old
-container or image until the candidate passes the checks below.
+The checked-in Quadlet starts in dry-run mode. Remove `Exec=--dry-run` from the
+installed unit only after Alertmanager routing and RCA quality have been
+validated. If the repository is not located at `/root/UyuniAI`, update the
+`EnvironmentFile` and configuration `Volume` paths in the installed Quadlet.
 
-## Health and acceptance checks
+## Health checks
+
+The Quadlet publishes the agent's observability endpoint only on host loopback:
 
 ```bash
-podman exec uyuni-server curl -fsS http://127.0.0.1:9898/healthz
-podman exec uyuni-server curl -fsS http://127.0.0.1:9898/readyz
-podman exec uyuni-server curl -fsS http://127.0.0.1:9898/metrics
-podman inspect --format '{{.State.Health.Status}}' ai-agent
+curl -fsS http://127.0.0.1:19898/healthz
+curl -fsS http://127.0.0.1:19898/readyz
+curl -fsS http://127.0.0.1:19898/metrics
+systemctl status uyuni-ai-agent.service --no-pager
 podman logs --since 10m ai-agent
 ```
 
-`healthz` proves the event loop and metrics listener are alive. `readyz` also
-requires at least one recent, complete minion snapshot and available Salt and
-Prometheus dependencies. A healthy process can therefore be intentionally
-unready while it retries a dependency. Other minions can be reported as
-incomplete without discarding the usable snapshots from healthy minions.
+`healthz` confirms that the process and observability listener are alive.
+`readyz` additionally requires a recent complete minion poll and usable Salt
+and Prometheus dependencies. One unreachable minion does not invalidate fresh
+snapshots collected from other minions.
 
-Accept a release only when:
+Accept a deployment when:
 
-1. the container health is healthy;
+1. the container health check passes;
 2. `readyz` returns HTTP 200 after a poll;
-3. both configured minions complete a poll;
-4. the queue is bounded and not continually growing;
-5. no unexpected dependency circuit remains open;
-6. dry-run RCA output contains current evidence and the correct component.
+3. every configured minion has completed a poll;
+4. the investigation queue is stable and below capacity;
+5. dependency circuits are closed; and
+6. dry-run output cites current evidence for the identified component.
 
 ## Protected Prometheus scrape
 
-The listener binds inside the container network and must not be published to
-the internet without a source restriction. Forward host TCP 9898 to the Uyuni
-container's TCP 9898 only from the monitoring VM (`52.91.91.80/32`), or use a
-private network/TLS reverse proxy. Verify the restriction from an unrelated
-source before enabling the scrape.
-
-The files under `deploy/monitoring/uyuni-ai-agent-metrics-*` provide the
-current lab deployment: a socket-activated `systemd-socket-proxyd` listener and
-an nftables input rule that accepts TCP 9898 only from `52.91.91.80`. The proxy
-resolves the `uyuni-server` bridge address whenever it starts, so recreating the
-container does not require a hard-coded address update.
-
-Merge `deploy/monitoring/prometheus-agent-scrape.yml` into Prometheus's
-`scrape_configs`, copy `deploy/monitoring/agent-self-alerts.yml` into its rule
-directory, and add that file under `rule_files`. Validate before reload:
+Port 9898 must not be exposed without a network restriction. Install the
+socket-activated proxy on the Uyuni host with the monitoring server's IPv4
+address:
 
 ```bash
-promtool check config /etc/prometheus/prometheus.yml
-promtool check rules /etc/prometheus/rules/agent-self-alerts.yml
-curl -fsS -X POST http://127.0.0.1:9090/-/reload
+deploy/agent/install-metrics-proxy.sh MONITORING_SERVER_IP
 ```
 
-For the current openSUSE monitoring VM, copy both YAML fragments to `/tmp` and
-run `deploy/monitoring/install-agent-monitoring.sh` as root. The installer is
-idempotent, validates a candidate configuration before replacement, preserves
-a timestamped backup, and restores that backup automatically if reload fails.
-
-Confirm `up{job="uyuni-ai-agent"} == 1` and exercise `readyz` degradation before
-considering self-monitoring complete.
-
-## Dependency failure drill
-
-Use a candidate container and an endpoint override; do not modify the image:
+On the Prometheus host, install the scrape job and self-monitoring rules with
+the Uyuni host name or address:
 
 ```bash
-# Add this option to the candidate `podman run` command above:
---env SALT_API_URL=https://127.0.0.1:1
+deploy/monitoring/install-agent-monitoring.sh UYUNI_HOSTNAME_OR_IP
 ```
 
-During the drill, `healthz` must remain 200, `readyz` must become 503, Salt's
-dependency metric must become zero, and the process must retry without a crash
-loop. Remove the override and replace the candidate. Readiness must recover
-after Salt login and at least one complete minion snapshot.
+Both installers validate their inputs and generated configuration. The
+Prometheus installer keeps a timestamped rollback copy and restores it if the
+reload fails. Confirm `up{job="uyuni-ai-agent"} == 1` after installation.
 
-## Rollback
+## Dependency failure test
 
-Stop and rename the failed candidate, then restart the retained prior
-container. The named volume preserves incident generations and alert identity.
-Never delete or recreate that volume as part of routine rollback. If a schema
-migration is introduced later, back up the SQLite database and document its
-backward-compatibility before deployment.
+Dependency recovery can be checked with a candidate environment file that
+temporarily points `SALT_API_URL` at an unreachable endpoint. During the test,
+`healthz` remains available, `readyz` becomes unavailable, and the Salt circuit
+opens without causing a process restart loop. Restore the endpoint and verify
+that readiness returns after Salt login and a successful minion poll.
 
-## Incident response for the agent
+Do not run this test against the active production environment file.
 
-- `healthz` down: inspect container state and the earliest exception.
-- `healthz` up, `readyz` down: inspect dependency and last-poll metrics.
-- queue saturation: reduce the incoming incident fan-out or restore the slow
-  dependency; do not make the queue unbounded.
-- Alertmanager delivery failures: preserve incidents as unacknowledged and
-  restore routing; the next cycle retries them.
+## Upgrade and rollback
+
+Retain the previous image before replacing the `production` tag. After loading
+the new image, restart `uyuni-ai-agent.service` and repeat the health checks.
+The named volume preserves incident identity across container replacement.
+
+For rollback, restore the previous image tag and restart the unit. Do not
+delete or recreate the state volume during routine rollback. Back up the
+SQLite database before deploying a release that changes its schema.
+
+## Agent incident response
+
+- `healthz` unavailable: inspect the container state and earliest exception.
+- `healthz` available but `readyz` unavailable: inspect dependency and
+  last-poll metrics.
+- queue saturation: restore the slow dependency or reduce incoming incident
+  fan-out; do not remove the queue bound.
+- Alertmanager delivery failures: retain the incident as unacknowledged so a
+  later poll can retry delivery.
 - stale or contradictory evidence: keep the RCA inconclusive and repair the
-  telemetry source before acting on a guessed cause.
+  telemetry source before acting.

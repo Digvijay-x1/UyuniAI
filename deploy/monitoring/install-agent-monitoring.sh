@@ -1,17 +1,35 @@
 #!/bin/sh
 set -eu
 
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <uyuni-agent-hostname-or-ip>" >&2
+    exit 2
+fi
+
+agent_target=$1
+case "$agent_target" in
+    *[!A-Za-z0-9._-]*|'')
+        echo "Agent target must be a hostname or IPv4 address." >&2
+        exit 2
+        ;;
+esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 config=/etc/prometheus/prometheus.yml
-rule_source=/tmp/agent-self-alerts.yml
-scrape_source=/tmp/prometheus-agent-scrape.yml
+rule_source=${script_dir}/agent-self-alerts.yml
+scrape_source=${script_dir}/prometheus-agent-scrape.yml
 rule_target=/etc/prometheus/rules/agent-self-alerts.yml
 candidate=$(mktemp)
 with_rules=$(mktemp)
-trap 'rm -f "$candidate" "$with_rules"' EXIT
+rendered_scrape=$(mktemp)
+trap 'rm -f "$candidate" "$with_rules" "$rendered_scrape"' EXIT
 
 test -r "$config"
 test -r "$rule_source"
 test -r "$scrape_source"
+
+sed "s/UYUNI_AGENT_TARGET/${agent_target}/g" \
+    "$scrape_source" > "$rendered_scrape"
 
 install -d -m 0755 -o root -g prometheus /etc/prometheus/rules
 install -m 0644 -o root -g prometheus "$rule_source" "$rule_target"
@@ -28,7 +46,7 @@ fi
 
 if ! grep -Eq 'job_name:.*uyuni-ai-agent' "$candidate"; then
     printf '\n' >> "$candidate"
-    tail -n +4 "$scrape_source" | sed 's/^  //' >> "$candidate"
+    tail -n +4 "$rendered_scrape" | sed 's/^  //' >> "$candidate"
 fi
 
 promtool check config "$candidate"

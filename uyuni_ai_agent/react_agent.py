@@ -99,28 +99,20 @@ ALL_TOOLS = [
 ]
 
 
-# Compiled agent cache, keyed by (provider, model). The chat-model constructor
-# (e.g. ChatOpenAI) opens its own httpx client pool, and LangGraph compilation is
-# non-trivial — both should happen once, not on every investigate() call (which
-# fires per anomaly, per minion, per cycle). The ReAct agent is stateless across
-# invocations (each ainvoke gets fresh messages), so reuse is safe.
+# Compiled agents are cached by provider and model to reuse the HTTP client and
+# LangGraph graph. Each invocation still receives a fresh message history.
 _agent_cache = {}
 
-# Structured-output LLM cache, keyed by (provider, model). Built from the same
-# provider/model as the ReAct agent but wrapped with .with_structured_output()
-# so the final formatting pass returns a validated RootCauseAnalysis instead of
-# free text. Cached for the same reason as the agent: the chat-model constructor
-# opens an httpx pool that should be created once, not per investigation.
+# Structured-output clients use the same cache key and return validated
+# RootCauseAnalysis instances.
 _structured_llm_cache = {}
 
 
 def get_structured_llm(config):
     """Return the shared LLM bound to the RootCauseAnalysis schema.
 
-    Requires a provider/model that supports native json_schema structured
-    output (see structured-output-models.md). ``with_structured_output`` makes
-    the model emit JSON conforming to the Pydantic schema, which LangChain then
-    parses into a RootCauseAnalysis instance.
+    The provider must implement native ``json_schema`` structured output.
+    LangChain parses the response into a ``RootCauseAnalysis`` instance.
     """
     cache_key = (config["llm"]["provider"], config["llm"]["model"])
     structured = _structured_llm_cache.get(cache_key)

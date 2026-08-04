@@ -7,9 +7,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 pytest-cache-files-*/
-
-# Local anomaly lab and one-off monitoring setup assets. Keep the tracked
-# deploy/alertmanager production configuration visible to Git.
 /deploy/reproduce_my_*.sh
 /deploy/configure_prometheus_client2.py
 /deploy/setup_client_monitoring.sh
+/deploy/production/
