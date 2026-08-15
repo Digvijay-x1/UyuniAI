@@ -11,3 +11,7 @@ pytest-cache-files-*/
 /deploy/configure_prometheus_client2.py
 /deploy/setup_client_monitoring.sh
 /deploy/production/
+/deploy/reprovision/
+/evaluation/live/
+/deploy/agent/sync-agent-uyuni-secret.sh
+/deploy/agent/uyuni-ai-agent-salt-api.conf
