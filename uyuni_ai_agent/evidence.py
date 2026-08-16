@@ -262,7 +262,12 @@ def ground_analysis(
 _HIGH_RISK_REMEDIATION = re.compile(
     r"(?i)(?:\brm\s+-rf\b|\bkill\s+-9\b|\bmkfs(?:\.|\s)|"
     r"\bdd\s+if=|\bdrop\s+(?:database|table)\b|\btruncate\s+table\b|"
-    r"\b(?:reboot|shutdown)\b)"
+    r"\b(?:reboot|shutdown)\b|\bchmod\s+(?:666|777)\b|"
+    r"\bStrictHostKeyChecking\s*=\s*no\b|"
+    r"\bUserKnownHostsFile\s*=\s*/dev/null\b|"
+    r"\bcurl\b[^\n]*(?:\s-k(?:\s|$)|\s--insecure\b)|"
+    r"\b(?:verify_tls|ssl_verify|verify)\s*=\s*(?:false|0)\b|"
+    r"\b(?:delete|remove|clear)\b[^.\n]*\bknown_hosts\b)"
 )
 
 
@@ -273,6 +278,22 @@ def _sanitize_remediation(steps: list[str], *, inconclusive: bool) -> list[str]:
         for step in steps
         if step.strip() and not _HIGH_RISK_REMEDIATION.search(step)
     ]
+    combined = " ".join(safe)
+    changes_ssh_trust = bool(re.search(
+        r"(?i)(?:known_hosts|host[- ]key).*(?:replace|update|change)|"
+        r"(?:replace|update|change).*(?:known_hosts|host[- ]key)",
+        combined,
+    ))
+    verifies_fingerprint = bool(re.search(
+        r"(?i)verify.*fingerprint.*(?:trusted|out.of.band|console)|"
+        r"fingerprint.*(?:trusted|out.of.band|console).*(?:verify|confirm)",
+        combined,
+    ))
+    if changes_ssh_trust and not verifies_fingerprint:
+        safe.insert(
+            0,
+            "Verify the presented SSH fingerprint through a trusted out-of-band channel before changing pinned trust.",
+        )
     if inconclusive:
         return [
             "Restore or refresh the missing evidence and repeat the investigation.",

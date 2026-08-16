@@ -30,6 +30,7 @@ _RUNTIME_ENDPOINT_OVERRIDES = {
     "PROMETHEUS_URL": ("prometheus", "url"),
     "ALERTMANAGER_URL": ("alertmanager", "url"),
     "SALT_API_URL": ("salt_api", "url"),
+    "UYUNI_API_URL": ("uyuni_api", "url"),
 }
 
 # Project root (parent of the uyuni_ai_agent package).
@@ -100,6 +101,10 @@ def load_config():
     salt_pw = os.environ.get("SALT_API_PASSWORD", "")
     if salt_pw:
         config.setdefault("salt_api", {})["password"] = salt_pw
+
+    uyuni_pw = os.environ.get("UYUNI_API_PASSWORD", "")
+    if uyuni_pw:
+        config.setdefault("uyuni_api", {})["password"] = uyuni_pw
 
     _apply_runtime_overrides(config)
 

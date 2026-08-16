@@ -131,6 +131,41 @@ def test_valid_config_is_normalized_and_preserves_dictionary_interface():
     assert config["minions"][0]["id"] == "database1"
 
 
+def test_uyuni_inventory_does_not_require_static_minions():
+    config = valid_config()
+    config["minions"] = []
+    config["dependency_correlation"]["postgres_apache"] = []
+    config["inventory"] = {
+        "provider": "uyuni",
+        "refresh_interval_seconds": 60,
+    }
+    config["uyuni_api"] = {
+        "url": "https://uyuni.example/rhn/manager/api",
+        "username": "inventory-agent",
+        "password": "test-only",
+    }
+
+    validated = validate_config(config)
+
+    assert validated["inventory"]["provider"] == "uyuni"
+    assert validated["minions"] == []
+
+
+def test_uyuni_inventory_requires_api_credentials():
+    config = valid_config()
+    config["minions"] = []
+    config["dependency_correlation"]["postgres_apache"] = []
+    config["inventory"] = {"provider": "uyuni"}
+    config["uyuni_api"] = {
+        "url": "https://uyuni.example/rhn/manager/api",
+        "username": "inventory-agent",
+        "password": "",
+    }
+
+    with pytest.raises(ValidationError, match="UYUNI_API_PASSWORD"):
+        validate_config(config)
+
+
 @pytest.mark.parametrize(
     "mutate, expected",
     [
@@ -200,6 +235,11 @@ def test_unknown_config_keys_are_rejected_as_likely_typos():
 
 def test_runtime_endpoint_overrides_support_immutable_images():
     config = valid_config()
+    config["uyuni_api"] = {
+        "url": "https://uyuni.example/rhn/manager/api",
+        "username": "inventory-agent",
+        "password": "test-only",
+    }
 
     _apply_runtime_overrides(
         config,
@@ -207,6 +247,7 @@ def test_runtime_endpoint_overrides_support_immutable_images():
             "PROMETHEUS_URL": "http://prometheus.override:9090",
             "ALERTMANAGER_URL": "http://alertmanager.override:9093",
             "SALT_API_URL": "https://salt.override:9080",
+            "UYUNI_API_URL": "https://uyuni.override/rhn/manager/api",
         },
     )
 
@@ -214,3 +255,7 @@ def test_runtime_endpoint_overrides_support_immutable_images():
     assert validated["prometheus"]["url"] == "http://prometheus.override:9090"
     assert validated["alertmanager"]["url"] == "http://alertmanager.override:9093"
     assert validated["salt_api"]["url"] == "https://salt.override:9080"
+    assert (
+        validated["uyuni_api"]["url"]
+        == "https://uyuni.override/rhn/manager/api"
+    )

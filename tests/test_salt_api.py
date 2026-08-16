@@ -52,6 +52,14 @@ def test_unconfigured_salt_target_is_rejected_before_network_access():
     )
 
 
+def test_discovered_minions_atomically_replace_the_salt_allowlist():
+    client = SaltAPIClient(salt_config())
+
+    client.replace_allowed_minions(["new-a", "new-b", "", "new-a"])
+
+    assert client.allowed_minions == frozenset({"new-a", "new-b"})
+
+
 def test_service_log_line_count_is_bounded_before_network_access():
     client = SaltAPIClient(salt_config())
 

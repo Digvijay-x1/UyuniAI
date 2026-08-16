@@ -16,17 +16,25 @@ import asyncio
 import logging
 import os
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
+from pydantic import ValidationError
 
 from uyuni_ai_agent import salt_api
-from uyuni_ai_agent.deterministic_analysis import try_deterministic_analysis
+from uyuni_ai_agent.deterministic_analysis import (
+    try_deterministic_analysis_with_metadata,
+)
 from uyuni_ai_agent.disk_inspection import parse_service_unit_references
 from uyuni_ai_agent.evidence import (
     EvidenceLedger,
     EvidenceStatus,
     evidence_status_for,
     ground_analysis,
+)
+from uyuni_ai_agent.langsmith_tracing import (
+    evidence_categories,
+    record_deterministic_rca,
 )
 from uyuni_ai_agent.llm_provider import get_llm
 from uyuni_ai_agent.models import (
@@ -40,6 +48,11 @@ from uyuni_ai_agent.tools.apache_tools import (
     get_apache_error_log,
     get_apache_overload_snapshot,
     get_apache_status,
+)
+from uyuni_ai_agent.tools.dependency_tools import (
+    inspect_nfs_dependency,
+    inspect_ssh_dependency,
+    inspect_tls_dependency,
 )
 from uyuni_ai_agent.tools.disk_tools import (
     find_large_files,
@@ -84,6 +97,9 @@ ALL_TOOLS = [
     get_service_logs,
     check_connectivity,
     get_listening_ports,
+    inspect_ssh_dependency,
+    inspect_tls_dependency,
+    inspect_nfs_dependency,
     # Apache tools
     get_apache_overload_snapshot,
     get_apache_status,
@@ -106,6 +122,60 @@ _agent_cache = {}
 # Structured-output clients use the same cache key and return validated
 # RootCauseAnalysis instances.
 _structured_llm_cache = {}
+
+
+def _rate_limit_retry_delay(error):
+    """Return a bounded retry delay for an HTTP 429, otherwise ``None``."""
+    response = getattr(error, "response", None)
+    status_code = getattr(error, "status_code", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if status_code != 429:
+        return None
+
+    retry_after = None
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        retry_after = headers.get("retry-after")
+    try:
+        delay = float(retry_after) if retry_after is not None else 60.0
+    except (TypeError, ValueError):
+        delay = 60.0
+    return max(1.0, min(delay, 120.0))
+
+
+async def _invoke_structured_with_rate_limit_retry(structured_llm, messages):
+    """Retry once for provider throttling or schema-invalid model output."""
+    try:
+        return await structured_llm.ainvoke(messages)
+    except Exception as error:
+        delay = _rate_limit_retry_delay(error)
+        validation_failure = isinstance(
+            error, (ValidationError, OutputParserException)
+        )
+        if delay is None and not validation_failure:
+            raise
+        retry_messages = list(messages)
+        if validation_failure:
+            logger.warning(
+                "Structured-output validation failed; requesting one schema "
+                "repair attempt: %s",
+                error,
+            )
+            retry_messages.append((
+                "human",
+                "Your previous response did not validate against the required "
+                "schema. Return every required field, use confidence as a "
+                "number from 0.0 to 1.0, preserve supplied evidence citations, "
+                "and do not add facts.",
+            ))
+        else:
+            logger.warning(
+                "Structured-output LLM rate-limited; retrying once in %.1fs",
+                delay,
+            )
+            await asyncio.sleep(delay)
+        return await structured_llm.ainvoke(retry_messages)
 
 
 def get_structured_llm(config):
@@ -637,6 +707,31 @@ async def collect_required_service_evidence(anomaly):
         value=listeners,
         detail_limit=8_000,
     )
+    dependency_lookup = getattr(client, "dependencies_for_service", None)
+    edges = (
+        dependency_lookup(anomaly.minion_id, service)
+        if dependency_lookup is not None
+        else []
+    )
+    if edges:
+        snapshots = await asyncio.gather(*(
+            client.inspect_dependency(edge["id"], edge["kind"])
+            for edge in edges
+        ))
+        for edge, snapshot in zip(edges, snapshots, strict=True):
+            _add_salt_evidence(
+                ledger,
+                target=(
+                    f"{edge['source_minion']}->{edge['target_minion']}"
+                ),
+                check=f"dependency_inspection:{edge['kind']}:{edge['id']}",
+                summary=(
+                    f"Read-only {edge['kind'].upper()} dependency snapshot "
+                    f"for configured edge {edge['id']}"
+                ),
+                value=snapshot,
+                detail_limit=24_000,
+            )
     return ledger
 
 
@@ -767,7 +862,7 @@ async def investigate(anomaly, metrics, config):
 
     quality = config.get("quality_gates", {}) if isinstance(config, dict) else {}
     if quality.get("deterministic_analysis_enabled", True):
-        deterministic = try_deterministic_analysis(
+        deterministic = try_deterministic_analysis_with_metadata(
             anomaly, required_evidence
         )
         if deterministic is not None:
@@ -775,11 +870,31 @@ async def investigate(anomaly, metrics, config):
                 "Deterministic evidence gate resolved metric=%s without LLM",
                 anomaly.metric_name,
             )
-            return ground_analysis(
-                deterministic,
+            grounded = ground_analysis(
+                deterministic.analysis,
                 required_evidence,
                 **_quality_options(config),
             )
+            try:
+                record_deterministic_rca(
+                    anomaly_type=anomaly.metric_name,
+                    analyzer=deterministic.analyzer,
+                    evidence_categories=evidence_categories(
+                        required_evidence.records
+                    ),
+                    evidence_count=len(required_evidence.records),
+                    conclusion=grounded.conclusion.value,
+                    confidence=grounded.confidence,
+                    urgency=grounded.urgency.value,
+                    llm_used=False,
+                )
+            except Exception as exc:
+                # Observability must never block or alter incident handling.
+                logger.warning(
+                    "Unable to record deterministic LangSmith span: %s",
+                    type(exc).__name__,
+                )
+            return grounded
 
     # Load system and scenario-specific prompts only for LLM investigations.
     system_prompt = load_prompt("system_prompt.md")
@@ -830,7 +945,7 @@ async def investigate(anomaly, metrics, config):
         f"context={anomaly.context})\n\n"
         f"INVESTIGATION:\n{reasoning}"
     )
-    analysis = await structured_llm.ainvoke([
+    analysis = await _invoke_structured_with_rate_limit_retry(structured_llm, [
         SystemMessage(
             content=(
                 "You format a completed system-administration investigation "

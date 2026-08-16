@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from uyuni_ai_agent.evidence import EvidenceLedger, EvidenceStatus
 from uyuni_ai_agent.models import (
@@ -26,17 +27,48 @@ from uyuni_ai_agent.models import (
 )
 
 
+@dataclass(frozen=True)
+class DeterministicAnalysisResult:
+    """A proven RCA plus its controlled, non-customer-specific analyzer ID."""
+
+    analysis: RootCauseAnalysis
+    analyzer: str
+
+
+def try_deterministic_analysis_with_metadata(
+    anomaly, ledger: EvidenceLedger
+) -> DeterministicAnalysisResult | None:
+    """Return a proven RCA and safe analyzer metadata, or ``None``."""
+    if anomaly.metric_name == "service_down":
+        analyzers = (
+            ("ssh_host_key_mismatch", _ssh_host_key_mismatch),
+            ("tls_identity_mismatch", _tls_identity_mismatch),
+            ("nfs_identity_drift", _nfs_identity_drift),
+            ("service_port_conflict", _service_port_conflict),
+        )
+    else:
+        configured = {
+            "disk": ("disk_crash_loop", _disk_crash_loop),
+            "postgres_blocked_transaction": (
+                "postgres_blocked_transaction",
+                _postgres_blocked_transaction,
+            ),
+            "memory_pressure": ("memory_pressure", _memory_pressure),
+            "memory": ("memory_pressure", _memory_pressure),
+        }.get(anomaly.metric_name)
+        analyzers = (configured,) if configured is not None else ()
+
+    for analyzer_name, analyzer in analyzers:
+        analysis = analyzer(anomaly, ledger)
+        if analysis is not None:
+            return DeterministicAnalysisResult(analysis, analyzer_name)
+    return None
+
+
 def try_deterministic_analysis(anomaly, ledger: EvidenceLedger):
-    """Return an RCA only for strict, directly testable evidence patterns."""
-    analyzers = {
-        "service_down": _service_port_conflict,
-        "disk": _disk_crash_loop,
-        "postgres_blocked_transaction": _postgres_blocked_transaction,
-        "memory_pressure": _memory_pressure,
-        "memory": _memory_pressure,
-    }
-    analyzer = analyzers.get(anomaly.metric_name)
-    return analyzer(anomaly, ledger) if analyzer is not None else None
+    """Return only the RCA for backward-compatible callers and tests."""
+    result = try_deterministic_analysis_with_metadata(anomaly, ledger)
+    return result.analysis if result is not None else None
 
 
 def _records(ledger, prefix):
@@ -101,6 +133,162 @@ def _service_port_conflict(anomaly, ledger):
         remediation=[
             f"Confirm whether {process} or {service} should own TCP port {port}.",
             "Stop or reconfigure only the unintended listener, then start the affected service.",
+        ],
+        urgency=_urgency(anomaly),
+        confidence=0.99,
+    )
+
+
+def _dependency_record(ledger, kind):
+    return next(iter(_records(ledger, f"dependency_inspection:{kind}:")), None)
+
+
+def _service_log_record(ledger):
+    return next(iter(_records(ledger, "service_logs:")), None)
+
+
+def _ssh_host_key_mismatch(anomaly, ledger):
+    logs = _service_log_record(ledger)
+    snapshot = _dependency_record(ledger, "ssh")
+    if not logs or not snapshot or not re.search(
+        r"remote host identification has changed|host key verification failed",
+        logs.details,
+        re.I,
+    ):
+        return None
+    source_text, separator, target_text = snapshot.details.partition(
+        "--- TARGET ---"
+    )
+    if not separator:
+        return None
+    pinned = set(re.findall(r"SHA256:[A-Za-z0-9+/=]+", source_text))
+    presented = set(re.findall(r"SHA256:[A-Za-z0-9+/=]+", target_text))
+    if not pinned or not presented or pinned & presented:
+        return None
+    pinned_label = ", ".join(sorted(pinned))
+    presented_label = ", ".join(sorted(presented))
+    service = anomaly.service_name or "SSH client job"
+    return RootCauseAnalysis(
+        summary=f"{service} rejected a changed SSH host key",
+        conclusion=AnalysisConclusion.CONFIRMED,
+        affected_component="SSH host-key trust",
+        root_cause=(
+            f"{service} rejected the remote endpoint because its pinned host "
+            f"key set {pinned_label} differs from the currently presented key "
+            f"set {presented_label} [{snapshot.id}], producing strict host-key "
+            f"verification failure [{logs.id}]."
+        ),
+        supporting_evidence_ids=[logs.id, snapshot.id],
+        key_evidence=[
+            f"[{logs.id}] The client reports a changed host identity and refuses the connection.",
+            f"[{snapshot.id}] Pinned fingerprint set {pinned_label} differs from presented fingerprint set {presented_label}.",
+        ],
+        remediation=[
+            "Verify the new presented fingerprint through a trusted out-of-band channel or the server console before changing trust.",
+            "If the rotation is authorized, replace only this configured host-and-port entry with the verified fingerprint; preserve the previous entry for rollback.",
+            "Run the job again with strict host-key checking still enabled.",
+        ],
+        urgency=_urgency(anomaly),
+        confidence=0.99,
+    )
+
+
+def _tls_identity_mismatch(anomaly, ledger):
+    logs = _service_log_record(ledger)
+    snapshot = _dependency_record(ledger, "tls")
+    if not logs or not snapshot:
+        return None
+    combined = f"{logs.details}\n{snapshot.details}"
+    if not re.search(
+        r"no alternative certificate subject name matches|hostname mismatch|verify error:num=62",
+        combined,
+        re.I,
+    ):
+        return None
+    san_match = re.search(
+        r"Subject Alternative Name:\s*\n?\s*DNS:([^,\s]+)",
+        snapshot.details,
+        re.I,
+    )
+    expected_match = re.search(
+        r"Verification error: hostname mismatch|verify error:num=62",
+        snapshot.details,
+        re.I,
+    )
+    if san_match is None or expected_match is None:
+        return None
+    service = anomaly.service_name or "TLS client job"
+    wrong_name = san_match.group(1)
+    return RootCauseAnalysis(
+        summary=f"{service} rejected the server certificate identity",
+        conclusion=AnalysisConclusion.CONFIRMED,
+        affected_component="TLS certificate identity",
+        root_cause=(
+            f"The configured endpoint presents a trusted certificate whose "
+            f"SAN is {wrong_name}, which does not match the requested hostname "
+            f"[{snapshot.id}]; the client therefore rejects the connection "
+            f"during hostname verification [{logs.id}]."
+        ),
+        supporting_evidence_ids=[logs.id, snapshot.id],
+        key_evidence=[
+            f"[{logs.id}] The client fails certificate hostname verification.",
+            f"[{snapshot.id}] The live certificate SAN is {wrong_name} and OpenSSL reports hostname mismatch.",
+        ],
+        remediation=[
+            "Confirm the intended service hostname and certificate issuance record.",
+            "Install a certificate whose SAN contains the intended hostname, or correct the endpoint only if configuration is wrong; retain the current certificate for rollback.",
+            "Re-run chain and hostname verification without disabling TLS verification before restarting the job.",
+        ],
+        urgency=_urgency(anomaly),
+        confidence=0.99,
+    )
+
+
+def _nfs_identity_drift(anomaly, ledger):
+    logs = _service_log_record(ledger)
+    snapshot = _dependency_record(ledger, "nfs")
+    if not logs or not snapshot or not re.search(
+        r"permission denied", logs.details, re.I
+    ):
+        return None
+    expected = re.search(
+        r"expected_uid=(\d+) expected_gid=(\d+)", snapshot.details
+    )
+    client = re.search(
+        r"mount=.*? uid=(\d+) gid=(\d+) mode=(\d+)", snapshot.details
+    )
+    server = re.search(
+        r"export=.*? uid=(\d+) gid=(\d+) mode=(\d+)", snapshot.details
+    )
+    if not expected or not client or not server:
+        return None
+    expected_ids = expected.group(1, 2)
+    client_ids = client.group(1, 2)
+    server_ids = server.group(1, 2)
+    if client_ids != server_ids or server_ids == expected_ids:
+        return None
+    service = anomaly.service_name or "NFS client job"
+    actual = f"{server_ids[0]}:{server_ids[1]}"
+    intended = f"{expected_ids[0]}:{expected_ids[1]}"
+    return RootCauseAnalysis(
+        summary=f"{service} is blocked by NFS numeric identity drift",
+        conclusion=AnalysisConclusion.CONFIRMED,
+        affected_component="NFS export ownership mapping",
+        root_cause=(
+            f"The mounted export and server directory both resolve to numeric "
+            f"owner {actual}, but the configured backup identity is {intended} "
+            f"[{snapshot.id}]. The client job consequently receives Permission "
+            f"denied while writing [{logs.id}]."
+        ),
+        supporting_evidence_ids=[logs.id, snapshot.id],
+        key_evidence=[
+            f"[{logs.id}] The backup process receives Permission denied on the mounted path.",
+            f"[{snapshot.id}] Client mount and server export show owner {actual}, not intended backup UID/GID {intended}.",
+        ],
+        remediation=[
+            "Confirm the intended numeric backup UID/GID and review the export identity-mapping policy on both nodes.",
+            f"Restore the export ownership mapping to {intended} only after validating that identity; record current owner {actual} for rollback.",
+            "Re-test a write as the backup service account without weakening export policy or applying world-writable permissions.",
         ],
         urgency=_urgency(anomaly),
         confidence=0.99,

@@ -21,6 +21,8 @@ Validation happens once at startup, before any external connection is opened.
 
 from __future__ import annotations
 
+import re
+from pathlib import PurePosixPath
 from typing import Literal
 from urllib.parse import urlparse
 
@@ -48,6 +50,12 @@ class PrometheusSettings(_HttpEndpoint):
     max_sample_age_seconds: float = Field(default=300, gt=0)
 
 
+class UyuniAPISettings(_HttpEndpoint):
+    username: str = Field(min_length=1)
+    password: str = ""
+    verify_tls: bool = True
+
+
 class SaltAPISettings(_HttpEndpoint):
     username: str = Field(min_length=1)
     password: str = ""
@@ -69,6 +77,45 @@ class MinionSettings(_StrictModel):
         if not value:
             raise ValueError("must not be blank")
         return value
+
+
+class PrometheusTargetJobs(_StrictModel):
+    node: list[str] = Field(
+        default_factory=lambda: ["node", "node-exporter", "node_exporter"]
+    )
+    apache: list[str] = Field(
+        default_factory=lambda: [
+            "apache",
+            "apache-exporter",
+            "apache_exporter",
+        ]
+    )
+    postgres: list[str] = Field(
+        default_factory=lambda: [
+            "postgres",
+            "postgres-exporter",
+            "postgres_exporter",
+        ]
+    )
+
+    @field_validator("node", "apache", "postgres")
+    @classmethod
+    def normalize_job_names(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip().lower() for item in value if item.strip()]
+        if not normalized:
+            raise ValueError("must contain at least one Prometheus job name")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Prometheus job names must be unique")
+        return normalized
+
+
+class InventorySettings(_StrictModel):
+    provider: Literal["static", "uyuni"] = "static"
+    refresh_interval_seconds: int = Field(default=60, gt=0)
+    node_exporter_port: int = Field(default=9100, ge=1, le=65535)
+    prometheus_jobs: PrometheusTargetJobs = Field(
+        default_factory=PrometheusTargetJobs
+    )
 
 
 class ThresholdBand(_StrictModel):
@@ -119,6 +166,7 @@ class LLMSettings(_StrictModel):
     provider: Literal["huggingface", "google_genai", "openai", "tokenrouter"]
     model: str = Field(min_length=1)
     api_key: str | None = None
+    requests_per_minute: float | None = Field(default=None, gt=0)
 
 
 class LoggingSettings(_StrictModel):
@@ -223,21 +271,106 @@ class ConcurrencySettings(_StrictModel):
     max_llm_calls: int = Field(gt=0)
 
 
-class DependencyEdge(_StrictModel):
+class PostgresApacheDependencyEdge(_StrictModel):
     postgres_minion: str = Field(min_length=1)
     apache_minion: str = Field(min_length=1)
 
 
+class InspectionDependencyEdge(_StrictModel):
+    """One topology-gated, read-only cross-minion inspection edge."""
+
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+    kind: Literal["ssh", "tls", "nfs"]
+    source_minion: str = Field(min_length=1)
+    source_service: str = Field(pattern=r"^[A-Za-z0-9_.@:-]+\.service$")
+    target_minion: str = Field(min_length=1)
+    target_host: str = Field(min_length=1)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    known_hosts_file: str | None = None
+    host_public_key_file: str | None = None
+    expected_hostname: str | None = None
+    ca_file: str | None = None
+    certificate_file: str | None = None
+    source_mount: str | None = None
+    target_export: str | None = None
+    expected_uid: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    expected_gid: int | None = Field(default=None, ge=0, le=2**31 - 1)
+
+    @field_validator(
+        "known_hosts_file",
+        "host_public_key_file",
+        "ca_file",
+        "certificate_file",
+        "source_mount",
+        "target_export",
+    )
+    @classmethod
+    def validate_absolute_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        path = PurePosixPath(value)
+        if (
+            not value.startswith("/")
+            or ".." in path.parts
+            or len(value) > 512
+            or any(ord(char) < 32 for char in value)
+        ):
+            raise ValueError("must be a bounded absolute POSIX path")
+        return value
+
+    @field_validator("target_host", "expected_hostname")
+    @classmethod
+    def validate_hostname(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().rstrip(".")
+        if not value or len(value) > 253 or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9.-]*", value
+        ):
+            raise ValueError("must be a hostname or IP address")
+        return value
+
+    @model_validator(mode="after")
+    def validate_kind_fields(self):
+        required = {
+            "ssh": ("port", "known_hosts_file", "host_public_key_file"),
+            "tls": (
+                "port",
+                "expected_hostname",
+                "ca_file",
+                "certificate_file",
+            ),
+            "nfs": (
+                "source_mount",
+                "target_export",
+                "expected_uid",
+                "expected_gid",
+            ),
+        }[self.kind]
+        missing = [name for name in required if getattr(self, name) is None]
+        if missing:
+            raise ValueError(
+                f"{self.kind} dependency requires: {', '.join(missing)}"
+            )
+        return self
+
+
 class DependencyCorrelationSettings(_StrictModel):
     grace_seconds: float = Field(default=90, ge=0)
-    postgres_apache: list[DependencyEdge] = Field(default_factory=list)
+    postgres_apache: list[PostgresApacheDependencyEdge] = Field(
+        default_factory=list
+    )
+    edges: list[InspectionDependencyEdge] = Field(default_factory=list)
 
 
 class Settings(_StrictModel):
     prometheus: PrometheusSettings
     alertmanager: _HttpEndpoint
     salt_api: SaltAPISettings
-    minions: list[MinionSettings] = Field(min_length=1)
+    uyuni_api: UyuniAPISettings | None = None
+    inventory: InventorySettings = Field(default_factory=InventorySettings)
+    minions: list[MinionSettings] = Field(default_factory=list)
     dependency_correlation: DependencyCorrelationSettings = Field(
         default_factory=DependencyCorrelationSettings
     )
@@ -270,6 +403,22 @@ class Settings(_StrictModel):
 
     @model_validator(mode="after")
     def validate_inventory_and_dependencies(self):
+        if self.inventory.provider == "static" and not self.minions:
+            raise ValueError(
+                "static inventory requires at least one configured minion"
+            )
+        if self.inventory.provider == "uyuni" and self.uyuni_api is None:
+            raise ValueError("Uyuni inventory requires uyuni_api settings")
+        if (
+            self.inventory.provider == "uyuni"
+            and self.uyuni_api is not None
+            and not self.uyuni_api.password
+        ):
+            raise ValueError(
+                "Uyuni inventory requires UYUNI_API_PASSWORD or "
+                "uyuni_api.password"
+            )
+
         by_id = {minion.id: minion for minion in self.minions}
         if len(by_id) != len(self.minions):
             raise ValueError("minion ids must be unique")
@@ -280,6 +429,10 @@ class Settings(_StrictModel):
             if edge_key in seen_edges:
                 raise ValueError(f"duplicate dependency edge: {edge_key}")
             seen_edges.add(edge_key)
+
+            # Dynamic inventories cannot validate membership until runtime.
+            if self.inventory.provider == "uyuni":
+                continue
 
             postgres_minion = by_id.get(edge.postgres_minion)
             apache_minion = by_id.get(edge.apache_minion)
@@ -303,6 +456,23 @@ class Settings(_StrictModel):
                     f"Apache dependency minion {edge.apache_minion!r} "
                     "has no apache_instance"
                 )
+
+        dependency_ids: set[str] = set()
+        for edge in self.dependency_correlation.edges:
+            if edge.id in dependency_ids:
+                raise ValueError(f"duplicate inspection dependency id: {edge.id}")
+            dependency_ids.add(edge.id)
+            if self.inventory.provider == "uyuni":
+                continue
+            for role, minion_id in (
+                ("source", edge.source_minion),
+                ("target", edge.target_minion),
+            ):
+                if minion_id not in by_id:
+                    raise ValueError(
+                        f"inspection dependency {edge.id!r} references unknown "
+                        f"{role} minion {minion_id!r}"
+                    )
         return self
 
 

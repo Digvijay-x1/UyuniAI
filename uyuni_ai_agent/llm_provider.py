@@ -14,6 +14,32 @@
 
 import os
 
+from langchain_core.rate_limiters import InMemoryRateLimiter
+
+_rate_limiters = {}
+
+
+def _get_rate_limiter(config):
+    """Return one process-wide limiter shared by all clients for a model."""
+    requests_per_minute = config["llm"].get("requests_per_minute")
+    if requests_per_minute is None:
+        return None
+
+    key = (
+        config["llm"]["provider"],
+        config["llm"]["model"],
+        float(requests_per_minute),
+    )
+    limiter = _rate_limiters.get(key)
+    if limiter is None:
+        limiter = InMemoryRateLimiter(
+            requests_per_second=float(requests_per_minute) / 60.0,
+            check_every_n_seconds=0.1,
+            max_bucket_size=1,
+        )
+        _rate_limiters[key] = limiter
+    return limiter
+
 
 def get_llm(config):
     """Return a configured LangChain chat LLM based on the passed config.
@@ -28,6 +54,7 @@ def get_llm(config):
     provider = config["llm"]["provider"]
     model = config["llm"]["model"]
     api_key = config["llm"].get("api_key", os.environ.get("LLM_API_KEY", ""))
+    rate_limiter = _get_rate_limiter(config)
 
     if provider == "huggingface":
         from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
@@ -51,6 +78,7 @@ def get_llm(config):
         return ChatOpenAI(
             model=model,
             api_key=api_key,
+            rate_limiter=rate_limiter,
         )
     elif provider == "tokenrouter":
         from langchain_openai import ChatOpenAI
@@ -58,6 +86,7 @@ def get_llm(config):
             model=model,
             api_key=api_key,
             base_url="https://api.tokenrouter.com/v1",
+            rate_limiter=rate_limiter,
         )
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")

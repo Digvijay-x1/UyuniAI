@@ -13,15 +13,24 @@ salt_api:
   password: ""  # set via SALT_API_PASSWORD env var
   eauth: "file"
 
-minions:
-  - id: "database.example.com"
-    instance: "database.example.com:9100"
-    apache_instance: "database.example.com:9117"
-    postgres_instance: "database.example.com:9187"
-  - id: "web.example.com"
-    instance: "web.example.com:9100"
-    apache_instance: "web.example.com:9117"
-    postgres_instance: "web.example.com:9187"
+uyuni_api:
+  url: "https://uyuni.example.com/rhn/manager/api"
+  username: "uyuniai-inventory"
+  password: ""  # set via UYUNI_API_PASSWORD env var
+  verify_tls: true
+
+inventory:
+  provider: "uyuni"
+  refresh_interval_seconds: 60
+  node_exporter_port: 9100
+  prometheus_jobs:
+    node: ["node"]
+    apache: ["apache"]
+    postgres: ["postgres"]
+
+# Static inventory remains supported when inventory.provider is "static".
+# Uyuni discovery leaves this empty and builds it at runtime.
+minions: []
 
 # Cross-minion correlation is topology-gated to prevent unrelated alerts from
 # different machines being merged solely because they happened at the same
@@ -30,9 +39,12 @@ dependency_correlation:
   # Prometheus targets scrape independently. Hold a one-sided dependency
   # candidate briefly so adjacent cycles can form one incident.
   grace_seconds: 90
-  postgres_apache:
-    - postgres_minion: "database.example.com"
-      apache_minion: "web.example.com"
+  # Cross-service topology cannot be inferred safely from host registration.
+  # Add known edges here or source them from system metadata in a later policy.
+  postgres_apache: []
+  # Protocol inspectors are read-only and accept only these stable edge IDs.
+  # Paths, hosts, ports, services, and minions cannot be supplied by the LLM.
+  edges: []
 
 thresholds:
   memory:
@@ -75,6 +87,8 @@ thresholds:
 llm:
   provider: "openai"  # "openai", "google_genai", "huggingface", or "tokenrouter"
   model: "replace-with-model-id"
+  # Optional process-wide limit shared by investigation and structuring calls.
+  # requests_per_minute: 30
   # api_key loaded from env: LLM_API_KEY
 
 logging:

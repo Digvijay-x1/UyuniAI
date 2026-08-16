@@ -187,6 +187,30 @@ def test_destructive_remediation_is_removed_even_when_evidence_is_valid():
     assert any("operator approval" in step for step in result.remediation)
 
 
+def test_protocol_bypass_remediation_is_removed_and_ssh_trust_is_guarded():
+    ledger = EvidenceLedger("client")
+    ledger.add(
+        source="salt",
+        check="dependency",
+        status=EvidenceStatus.OK,
+        summary="Dependency identity mismatch",
+    )
+    result = ground_analysis(analysis(remediation=[
+        "Use curl --insecure until the certificate is fixed",
+        "Run curl -k https://service.example",
+        "Delete the known_hosts file",
+        "Run chmod 777 /mnt/backup",
+        "Update the pinned host-key entry",
+    ]), ledger)
+
+    text = " ".join(result.remediation)
+    assert "--insecure" not in text
+    assert "curl -k" not in text
+    assert "Delete the known_hosts" not in text
+    assert "chmod 777" not in text
+    assert text.startswith("Verify the presented SSH fingerprint")
+
+
 def test_telemetry_blind_spot_produces_deterministic_cited_analysis(monkeypatch):
     anomaly = Anomaly(
         minion_id="client2",

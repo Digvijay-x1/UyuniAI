@@ -37,6 +37,7 @@ from uyuni_ai_agent.anomaly_detector import (
 )
 from uyuni_ai_agent.config import load_config
 from uyuni_ai_agent.incident_store import IncidentStore
+from uyuni_ai_agent.inventory import InventoryProvider
 from uyuni_ai_agent.investigation_queue import (
     CancelStatus,
     EnqueueStatus,
@@ -832,6 +833,7 @@ async def run(dry_run=False):
         logger.info("DRY RUN mode: alerts will be printed, not sent.")
 
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+    inventory_provider = InventoryProvider(config)
     salt = SaltAPIClient(config, dependency_manager=dependency_manager)
     set_salt_client(salt)
     salt_recovery_task = None
@@ -898,10 +900,16 @@ async def run(dry_run=False):
         while not stop.is_set():
             poll_started = time.monotonic()
             successful_minions = 0
+            cycle_minions = []
             try:
+                cycle_minions = await inventory_provider.refresh(http_client)
+                salt.replace_allowed_minions(
+                    minion["id"] for minion in cycle_minions
+                )
+                cycle_config = {**config, "minions": cycle_minions}
                 successful_minions = await asyncio.wait_for(
                     execute_poll_cycle(
-                        config=config,
+                        config=cycle_config,
                         http_client=http_client,
                         minion_sem=minion_sem,
                         salt=salt,
@@ -933,7 +941,7 @@ async def run(dry_run=False):
                 )
             poll_outcome = observability.record_poll(
                 duration_seconds=time.monotonic() - poll_started,
-                total_minions=len(config["minions"]),
+                total_minions=len(cycle_minions),
                 successful_minions=successful_minions,
             )
 
@@ -951,7 +959,7 @@ async def run(dry_run=False):
                 "Agent poll outcome=%s successful_minions=%d/%d",
                 poll_outcome,
                 successful_minions,
-                len(config["minions"]),
+                len(cycle_minions),
             )
             logger.info("Sleeping %ds...", interval)
             # Sleep for the interval, but wake promptly if asked to stop.
@@ -980,6 +988,7 @@ async def run(dry_run=False):
                 shutdown.abandoned,
             )
         await http_client.aclose()
+        await inventory_provider.aclose()
         await salt.aclose()
         incident_store.close()
         logger.info("AI Monitoring Agent stopped.")

@@ -22,6 +22,7 @@ import httpx
 
 from uyuni_ai_agent.apache_inspection import build_apache_overload_command
 from uyuni_ai_agent.cpu_inspection import build_cpu_pressure_command
+from uyuni_ai_agent.dependency_inspection import BUILDERS
 from uyuni_ai_agent.disk_inspection import (
     build_large_files_command,
     build_service_references_command,
@@ -87,6 +88,8 @@ class SaltAPIClient:
         self.allowed_minions = frozenset(
             minion["id"] for minion in config["minions"]
         )
+        edges = config.get("dependency_correlation", {}).get("edges", [])
+        self._inspection_dependencies = {edge["id"]: edge for edge in edges}
         # Global cap on concurrent Salt API calls (protects the Salt Master).
         self.salt_semaphore = asyncio.Semaphore(
             concurrency_cfg.get("max_salt_calls", 10)
@@ -97,6 +100,63 @@ class SaltAPIClient:
         self._dependency_manager = dependency_manager
         self._operation_timeout_seconds = float(
             config.get("timeouts", {}).get("salt_operation_seconds", 70)
+        )
+
+    def replace_allowed_minions(self, minion_ids) -> None:
+        """Atomically replace the trusted Salt target allowlist.
+
+        Dynamic discovery is sourced from authenticated Uyuni inventory, never
+        from Prometheus labels or an LLM-provided target.
+        """
+        normalized = frozenset(
+            value.strip()
+            for value in minion_ids
+            if isinstance(value, str) and value.strip()
+        )
+        self.allowed_minions = normalized
+        logger.info("Salt allowlist now contains %d minion(s)", len(normalized))
+
+    def dependencies_for_service(self, minion_id, service):
+        """Return configured edges originating at one exact failed unit."""
+        return [
+            edge
+            for edge in self._inspection_dependencies.values()
+            if edge["source_minion"] == minion_id
+            and edge["source_service"] == service
+        ]
+
+    def _dependency(self, dependency_id, kind):
+        edge = self._inspection_dependencies.get(dependency_id)
+        if edge is None or edge["kind"] != kind:
+            raise ValueError(
+                f"{kind} dependency {dependency_id!r} is not configured"
+            )
+        if (
+            edge["source_minion"] not in self.allowed_minions
+            or edge["target_minion"] not in self.allowed_minions
+        ):
+            raise ValueError(
+                f"dependency {dependency_id!r} references a minion outside "
+                "the current authenticated inventory"
+            )
+        return edge
+
+    async def inspect_dependency(self, dependency_id, kind):
+        """Inspect both ends of one configured edge with fixed commands."""
+        edge = self._dependency(dependency_id, kind)
+        source_builder, target_builder = BUILDERS[kind]
+        source, target = await asyncio.gather(
+            self.run_command(
+                edge["source_minion"], source_builder(edge)
+            ),
+            self.run_command(
+                edge["target_minion"], target_builder(edge)
+            ),
+        )
+        return (
+            f"DEPENDENCY id={edge['id']} kind={kind} "
+            f"source={edge['source_minion']} target={edge['target_minion']}\\n"
+            f"--- SOURCE ---\\n{source}\\n--- TARGET ---\\n{target}"
         )
 
     async def start(self):
