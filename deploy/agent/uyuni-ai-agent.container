@@ -12,7 +12,6 @@ EnvironmentFile=/root/UyuniAI/.env
 Volume=/root/UyuniAI/config:/opt/uyuni-ai-agent/config:ro,Z
 Volume=uyuni-ai-agent-state:/var/lib/uyuni-ai-agent:Z
 Exec=--dry-run
-HealthCmd=/usr/local/bin/python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9898/healthz', timeout=3)"
 HealthInterval=30s
 HealthTimeout=5s
 HealthRetries=3

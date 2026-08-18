@@ -46,7 +46,9 @@ fi
 
 if ! grep -Eq 'job_name:.*uyuni-ai-agent' "$candidate"; then
     printf '\n' >> "$candidate"
-    tail -n +4 "$rendered_scrape" | sed 's/^  //' >> "$candidate"
+    # Keep the list item nested beneath the existing top-level
+    # ``scrape_configs`` key.
+    tail -n +4 "$rendered_scrape" >> "$candidate"
 fi
 
 promtool check config "$candidate"

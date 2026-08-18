@@ -1,62 +1,74 @@
 {{/*
-  Notification templates for the Uyuni AI Monitoring Agent.
+  Production-style notifications for alerts emitted by the Uyuni AI agent.
 
-  These render the structured annotations the agent attaches to each alert
-  (root_cause, key_evidence, remediation, urgency, confidence, ...).
-
-  Install alongside alertmanager.yml, e.g.:
-    /etc/alertmanager/templates/ai_agent.tmpl
-  and reference the templates dir in alertmanager.yml:
-    templates:
-      - "/etc/alertmanager/templates/*.tmpl"
+  The layout is deliberately compact: responders see state and severity first,
+  then scope, diagnosis, evidence, and safe next actions. All rendered values
+  come from the alert contract documented in docs/alert-contract.md.
 */}}
 
-{{/* ── Slack title ─────────────────────────────────────────────────────── */}}
-{{ define "ai_agent.slack.title" -}}
-{{ if eq .Status "firing" }} {{ else }} {{ end }} [{{ .Status | toUpper }}] AI Agent: {{ .CommonAnnotations.summary }}
+{{ define "ai_agent.slack.severity" -}}
+{{- if eq . "critical" -}}CRITICAL{{- else if eq . "warning" -}}WARNING{{- else -}}{{ . | toUpper }}{{- end -}}
 {{- end }}
 
-{{/* ── Slack body ──────────────────────────────────────────────────────── */}}
-{{ define "ai_agent.slack.text" -}}
-{{ range .Alerts }}
-*Minion:* {{ .Labels.minion }}   *Metric:* {{ .Labels.metric }}   *Severity:* {{ .Labels.severity }}
-*Urgency:* {{ .Annotations.urgency }}   *Confidence:* {{ .Annotations.confidence }}
+{{ define "ai_agent.slack.title" -}}
+{{- if eq .Status "firing" -}}:red_circle: FIRING{{- else -}}:large_green_circle: RESOLVED{{- end }} | {{ template "ai_agent.slack.severity" .CommonLabels.severity }} | {{ .CommonAnnotations.summary }}
+{{- end }}
 
-*Root Cause*
+{{ define "ai_agent.slack.text" -}}
+{{- range .Alerts }}
+{{- if eq .Status "firing" }}
+*Response required*  |  *Urgency:* {{ .Annotations.urgency }}  |  *Confidence:* {{ .Annotations.confidence }}
+
+*Scope*
+Host: `{{ .Labels.minion }}`  |  Component: `{{ .Annotations.affected_component }}`  |  Signal: `{{ .Labels.metric }}`
+Started: `{{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}`{{ if .Labels.incident_id }}  |  Incident: `{{ printf "%.12s" .Labels.incident_id }}`{{ end }}
+
+*Diagnosis — {{ .Annotations.conclusion }}*
+{{ .Annotations.root_cause }}
+{{- if .Annotations.key_evidence }}
+
+*Supporting evidence*
+{{ .Annotations.key_evidence }}
+{{- end }}
+{{- if .Annotations.remediation }}
+
+*Recommended next actions*
+{{ .Annotations.remediation }}
+{{- end }}
+
+_Operator approval is required before remediation. Validate impact and follow the service runbook/change process._
+{{- else }}
+*Service restored*
+
+Host: `{{ .Labels.minion }}`  |  Component: `{{ .Annotations.affected_component }}`  |  Signal: `{{ .Labels.metric }}`
+Started: `{{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}`  |  Resolved: `{{ .EndsAt.Format "2006-01-02 15:04:05 UTC" }}`{{ if .Labels.incident_id }}  |  Incident: `{{ printf "%.12s" .Labels.incident_id }}`{{ end }}
+
+*Original diagnosis*
 {{ .Annotations.root_cause }}
 
-*Affected Component*
-{{ .Annotations.affected_component }}
+_Confirm user-facing recovery and close or document the incident according to the team process._
+{{- end }}
+{{- if .GeneratorURL }}
 
-{{ if .Annotations.key_evidence -}}
-*Key Evidence*
-{{ .Annotations.key_evidence }}
-{{ end }}
-{{- if .Annotations.remediation -}}
-*Remediation*
-{{ .Annotations.remediation }}
-{{ end }}
-{{ if .GeneratorURL }}<{{ .GeneratorURL }}|Source>{{ end }}
-{{ end }}
+<{{ .GeneratorURL }}|Open alert source>
+{{- end }}
+{{- end }}
 {{- end }}
 
-{{/* ── Generic email/webhook body (plain text) ─────────────────────────── */}}
+{{/* Generic email/webhook body (plain text). */}}
 {{ define "ai_agent.text" -}}
 {{ range .Alerts }}
-[{{ .Status | toUpper }}] {{ .Annotations.summary }}
-Minion: {{ .Labels.minion }} | Metric: {{ .Labels.metric }} | Severity: {{ .Labels.severity }}
-Urgency: {{ .Annotations.urgency }} | Confidence: {{ .Annotations.confidence }}
+[{{ .Status | toUpper }}] [{{ template "ai_agent.slack.severity" .Labels.severity }}] {{ .Annotations.summary }}
+Host: {{ .Labels.minion }} | Component: {{ .Annotations.affected_component }} | Signal: {{ .Labels.metric }}
+Urgency: {{ .Annotations.urgency }} | Confidence: {{ .Annotations.confidence }}{{ if .Labels.incident_id }} | Incident: {{ printf "%.12s" .Labels.incident_id }}{{ end }}
 
-Root Cause:
-  {{ .Annotations.root_cause }}
+Diagnosis ({{ .Annotations.conclusion }}):
+{{ .Annotations.root_cause }}
 
-Affected Component:
-  {{ .Annotations.affected_component }}
-
-Key Evidence:
+Supporting evidence:
 {{ .Annotations.key_evidence }}
 
-Remediation:
+Recommended next actions:
 {{ .Annotations.remediation }}
 ---
 {{ end }}

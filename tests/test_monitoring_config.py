@@ -62,9 +62,13 @@ def test_metrics_proxy_is_source_restricted_and_socket_activated():
 
 def test_production_quadlet_exposes_only_a_loopback_metrics_backend():
     quadlet = (ROOT / "deploy/agent/uyuni-ai-agent.container").read_text()
+    containerfile = (ROOT / "Containerfile").read_text()
 
     assert "PublishPort=127.0.0.1:19898:9898" in quadlet
-    assert "HealthCmd=/usr/local/bin/python" in quadlet
+    # Keep the JSON-form image healthcheck instead of overriding it with a
+    # shell-quoted Quadlet command that can be parsed differently by systemd.
+    assert "HealthCmd=" not in quadlet
+    assert "HEALTHCHECK" in containerfile
 
 
 def test_agent_monitoring_installers_render_site_specific_addresses():
@@ -78,3 +82,20 @@ def test_agent_monitoring_installers_render_site_specific_addresses():
     assert "UYUNI_AGENT_TARGET" in monitoring_installer
     assert "MONITORING_SERVER_IP" in proxy_installer
     assert "monitoring-server-ipv4" in proxy_installer
+
+
+def test_slack_notification_template_has_incident_response_context():
+    template = (
+        ROOT / "deploy/alertmanager/templates/ai_agent.tmpl"
+    ).read_text()
+
+    assert "Response required" in template
+    assert "Service restored" in template
+    assert ".Labels.incident_id" in template
+    assert ".Annotations.conclusion" in template
+    assert ".Annotations.root_cause" in template
+    assert ".Annotations.key_evidence" in template
+    assert ".Annotations.remediation" in template
+    assert "Operator approval is required" in template
+    assert ".StartsAt.Format" in template
+    assert ".EndsAt.Format" in template

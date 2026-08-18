@@ -1,5 +1,7 @@
 global:
   resolve_timeout: 5m
+  # Provision this file separately. Never commit an incoming webhook URL.
+  slack_api_url_file: /etc/prometheus/slack-webhook-url
 
 templates:
   - "/etc/prometheus/alertmanager_templates/*.tmpl"
@@ -26,13 +28,13 @@ receivers:
 
   - name: ai-agent-slack
     slack_configs:
-      - api_url: "webhook"
-        channel: "#uyuniai"
-        send_resolved: true
+      - send_resolved: true
+        username: Uyuni AI Incident Bot
+        icon_emoji: ':shield:'
         title: '{{ template "ai_agent.slack.title" . }}'
         text: '{{ template "ai_agent.slack.text" . }}'
         color: >-
-          {{ if eq .CommonLabels.severity "critical" }}danger{{ else if eq .CommonLabels.severity "warning" }}warning{{ else }}good{{ end }}
+          {{ if eq .Status "resolved" }}good{{ else if eq .CommonLabels.severity "critical" }}danger{{ else if eq .CommonLabels.severity "warning" }}warning{{ else }}#439FE0{{ end }}
 
 inhibit_rules:
   - source_matchers: [severity="critical"]

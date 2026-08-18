@@ -47,4 +47,14 @@ systemctl enable --now \
     uyuni-ai-agent-metrics-firewall.service \
     uyuni-ai-agent-metrics-proxy.socket
 
+# firewalld's later input hook can still reject traffic accepted by the
+# dedicated nftables chain. Add the same source-scoped permission there when
+# firewalld is active; do not open the port generally.
+if command -v firewall-cmd >/dev/null 2>&1 \
+    && firewall-cmd --state >/dev/null 2>&1; then
+    firewall_rule="rule family=ipv4 source address=${monitoring_ip} port port=9898 protocol=tcp accept"
+    firewall-cmd --permanent --add-rich-rule="${firewall_rule}"
+    firewall-cmd --reload
+fi
+
 echo "Agent metrics are exposed only to ${monitoring_ip}."
