@@ -1,5 +1,10 @@
 # Operations
 
+This guide covers deployment-wide procedures. For alert-specific diagnosis,
+use the [operator runbooks](runbooks/README.md). Configuration ownership and
+runtime semantics are documented in [Configuration](configuration.md) and
+[Architecture](architecture.md).
+
 ## Runtime contract
 
 The agent runs as a non-root Podman container on the Uyuni-managed `uyuni`
@@ -117,3 +122,7 @@ SQLite database before deploying a release that changes its schema.
   later poll can retry delivery.
 - stale or contradictory evidence: keep the RCA inconclusive and repair the
   telemetry source before acting.
+
+The self-monitoring alert rules map to step-by-step procedures in the
+[runbook index](runbooks/README.md). Do not delete the SQLite state volume,
+disable queue bounds, or bypass evidence quality gates as an incident shortcut.

@@ -1,5 +1,10 @@
 # Evaluation
 
+Evaluation verifies the analysis and safety contracts described in
+[Architecture](architecture.md) and [Security](security.md). Changes to a
+detector, inspection tool, deterministic pattern, prompt, model, or evidence
+quality gate should update this catalog in the same pull request.
+
 The catalog in `evaluation/scenarios.yaml` defines repeatable pass/fail
 criteria for baseline, correlation, root-cause-chain, and adversarial cases.
 
