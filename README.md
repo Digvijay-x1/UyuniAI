@@ -1,4 +1,13 @@
-# AI-Powered Monitoring Agent for Uyuni
+# GSoC'26 AI-Powered Monitoring Agent for Uyuni
+
+> **Google Summer of Code 2026 project for openSUSE**
+>
+> This project was developed for [Google Summer of Code 2026 with
+openSUSE](https://www.opensuse.org/), under the original [AI-Powered
+Intelligent Monitoring and Root Cause Analysis for Uyuni
+proposal](https://github.com/openSUSE/mentoring/issues/251). Mentors were Jordi
+Massaguer and Oscar Barrios. The [GSoC final report](docs/gsoc-final-report.md)
+is the evaluation and handover document for this repository.
 
 The Uyuni AI Agent provides evidence-driven incident investigation for
 [Uyuni](https://www.uyuni-project.org/). It detects anomalous telemetry from
@@ -158,6 +167,8 @@ Use the [documentation index](docs/README.md) to find the right guide:
 - [Runbooks](docs/runbooks/README.md): response procedures for self-monitoring
   alerts.
 - [Evaluation](docs/evaluation.md): scenario-based RCA quality checks.
+- [GSoC 2026 final report](docs/gsoc-final-report.md): project accomplishments,
+  validation, code cutoff, and concrete remaining tasks.
 - [ADRs](docs/adr/README.md): rationale behind durable design choices.
 
 Contribution and vulnerability-reporting policies are in
@@ -165,10 +176,12 @@ Contribution and vulnerability-reporting policies are in
 
 ## Project status
 
-The repository is under active development. Treat model/provider compatibility,
-deployment topology, thresholds, Salt permissions, and notification routing as
-environment-specific release concerns. Use dry-run and the evaluation catalog
-before enabling production delivery.
+The GSoC implementation is complete as of the cutoff recorded in the [final
+report](docs/gsoc-final-report.md). The repository may receive future
+maintenance and environment-specific release work: model/provider
+compatibility, deployment topology, thresholds, Salt permissions, and
+notification routing still need to be tuned for each installation. Use dry-run
+and the evaluation catalog before enabling production delivery.
 
 ## License
 

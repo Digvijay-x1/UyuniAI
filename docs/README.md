@@ -9,6 +9,7 @@ point; use this index when you need the detailed contract for a specific task.
 | Audience | Document | Purpose |
 |---|---|---|
 | Evaluators and new users | [Project README](../README.md) | Capabilities, prerequisites, and safe first steps |
+| GSoC evaluators and future maintainers | [GSoC 2026 final report](gsoc-final-report.md) | Accomplishments, code cutoff, validation, and remaining work |
 | Developers and reviewers | [Architecture](architecture.md) | Components, data flow, lifecycle, and failure behavior |
 | Deployers | [Operations](operations.md) | Production deployment, health checks, upgrade, and rollback |
 | Config owners | [Configuration](configuration.md) | Settings, environment variables, defaults, and tuning guidance |
